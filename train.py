@@ -123,6 +123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if nmap.shape[-1] == 3:
                     nmap = np.transpose(nmap, (2, 0, 1))
                 normal_priors[cam_name] = torch.tensor(nmap).cuda().float()
+        print(f"Loaded {len(normal_priors)} normal priors.")
                 
     depth_priors = {}
     depths_dir = os.path.join(dataset.source_path, "depths")
@@ -135,6 +136,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if len(dmap.shape) == 2:
                     dmap = dmap[np.newaxis, ...]
                 depth_priors[cam_name] = torch.tensor(dmap).cuda().float()
+        print(f"Loaded {len(depth_priors)} depth priors.")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
