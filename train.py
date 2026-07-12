@@ -203,8 +203,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Normal Loss
         if opt.lambda_normal > 0 and viewpoint_cam.image_name in normal_priors:
             gt_normal = normal_priors[viewpoint_cam.image_name]
-            rendered_normals = render(viewpoint_cam, gaussians, pipe, background, override_color=gaussians.get_normals_rgb())["render"]
-            rendered_normals = rendered_normals * 2.0 - 1.0 # map back to [-1, 1]
+            rendered_normals = render_pkg["rendered_normal"]
             if gt_normal.shape[1:] != rendered_normals.shape[1:]:
                 gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=rendered_normals.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
             mask = viewpoint_cam.original_image[0:1]*0 + 1.0 

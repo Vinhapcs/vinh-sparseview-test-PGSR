@@ -156,9 +156,6 @@ class GaussianModel:
         normal_global = torch.where(neg_mask.unsqueeze(-1), -normal_global, normal_global)
         return normal_global
     
-    def get_normals_rgb(self):
-        normals = self.get_smallest_axis()
-        return (normals + 1.0) / 2.0
         
     def get_smallest_scale(self):
         return self.get_scaling.min(dim=-1)[0]
