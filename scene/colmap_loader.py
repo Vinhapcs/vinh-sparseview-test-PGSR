@@ -152,7 +152,7 @@ def read_points3D_binary(path_to_model_file):
             track_elems = read_next_bytes(
                 fid, num_bytes=8*track_length,
                 format_char_sequence="ii"*track_length)
-            if error > 2.0 or track_length < 3:
+            if error > 2.0:
                 continue
             xyzs[count] = xyz
             rgbs[count] = rgb
