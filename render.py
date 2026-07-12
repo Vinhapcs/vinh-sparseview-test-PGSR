@@ -121,7 +121,7 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
             pose = np.identity(4)
             pose[:3,:3] = view.R.transpose(-1,-2)
             pose[:3, 3] = view.T
-            color = o3d.io.read_image(os.path.join(render_path, view.image_name + ".jpg"))
+            color = o3d.io.read_image(os.path.join(render_path, view.image_name + ".png"))
             depth = o3d.geometry.Image((ref_depth*1000).astype(np.uint16))
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
                 color, depth, depth_scale=1000.0, depth_trunc=max_depth, convert_rgb_to_intensity=False)
