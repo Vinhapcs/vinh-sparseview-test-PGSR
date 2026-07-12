@@ -19,8 +19,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
-from pytorch3d.transforms import quaternion_to_matrix
+from utils.general_utils import strip_symmetric, build_scaling_rotation, build_rotation
 
 def dilate(bin_img, ksize=5):
     pad = (ksize - 1) // 2
@@ -154,7 +153,7 @@ class GaussianModel:
         normal_global = self.get_smallest_axis()
         gaussian_to_cam_global = view_cam.camera_center - self._xyz
         neg_mask = (normal_global * gaussian_to_cam_global).sum(-1) < 0.0
-        normal_global[neg_mask] = -normal_global[neg_mask]
+        normal_global = torch.where(neg_mask.unsqueeze(-1), -normal_global, normal_global)
         return normal_global
     
     def get_normals_rgb(self):
@@ -165,7 +164,7 @@ class GaussianModel:
         return self.get_scaling.min(dim=-1)[0]
     
     def get_rotation_matrix(self):
-        return quaternion_to_matrix(self.get_rotation)
+        return build_rotation(self.get_rotation)
 
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)

@@ -25,20 +25,21 @@ def slerp(q1, q2, t):
     return ratio_a.unsqueeze(-1) * q1 + ratio_b.unsqueeze(-1) * q2_corrected
 
 def interpolate_cameras(cam1, cam2, t):
-    from pytorch3d.transforms import matrix_to_quaternion, quaternion_to_matrix
+    import scipy.spatial.transform
     # Interpolate translation
-    T1 = torch.tensor(cam1.T, dtype=torch.float32) if not isinstance(cam1.T, torch.Tensor) else cam1.T.float()
-    T2 = torch.tensor(cam2.T, dtype=torch.float32) if not isinstance(cam2.T, torch.Tensor) else cam2.T.float()
+    T1 = cam1.T if isinstance(cam1.T, np.ndarray) else cam1.T.cpu().numpy()
+    T2 = cam2.T if isinstance(cam2.T, np.ndarray) else cam2.T.cpu().numpy()
     T_interp = (1 - t) * T1 + t * T2
     
     # Interpolate rotation
-    R1 = torch.tensor(cam1.R, dtype=torch.float32) if not isinstance(cam1.R, torch.Tensor) else cam1.R.float()
-    R2 = torch.tensor(cam2.R, dtype=torch.float32) if not isinstance(cam2.R, torch.Tensor) else cam2.R.float()
-    q1 = matrix_to_quaternion(R1)
-    q2 = matrix_to_quaternion(R2)
-    q_interp = slerp(q1, q2, t)
-    R_interp = quaternion_to_matrix(q_interp)
-    return R_interp, T_interp
+    R1 = cam1.R if isinstance(cam1.R, np.ndarray) else cam1.R.cpu().numpy()
+    R2 = cam2.R if isinstance(cam2.R, np.ndarray) else cam2.R.cpu().numpy()
+    
+    key_rots = scipy.spatial.transform.Rotation.from_matrix([R1, R2])
+    slerp_func = scipy.spatial.transform.Slerp([0, 1], key_rots)
+    R_interp = slerp_func([t])[0].as_matrix()
+    
+    return torch.tensor(R_interp, dtype=torch.float32).cuda(), torch.tensor(T_interp, dtype=torch.float32).cuda()
 
 def warp_image(src_cam, tgt_R, tgt_T, depth_map, conf_map=None):
     # depth_map: [H, W]

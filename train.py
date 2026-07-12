@@ -269,15 +269,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 pts_in_nearest_cam = pts @ nearest_cam.world_view_transform[:3,:3] + nearest_cam.world_view_transform[3,:3]
                 map_z, d_mask = gaussians.get_points_depth_in_depth_map(nearest_cam, nearest_render_pkg['plane_depth'], pts_in_nearest_cam)
                 
-                pts_in_nearest_cam = pts_in_nearest_cam / (pts_in_nearest_cam[:,2:3])
+                pts_in_nearest_cam = pts_in_nearest_cam / (pts_in_nearest_cam[:,2:3] + 1e-8)
                 pts_in_nearest_cam = pts_in_nearest_cam * map_z.squeeze()[...,None]
                 R = torch.tensor(nearest_cam.R).float().cuda()
                 T = torch.tensor(nearest_cam.T).float().cuda()
                 pts_ = (pts_in_nearest_cam-T)@R.transpose(-1,-2)
                 pts_in_view_cam = pts_ @ viewpoint_cam.world_view_transform[:3,:3] + viewpoint_cam.world_view_transform[3,:3]
                 pts_projections = torch.stack(
-                            [pts_in_view_cam[:,0] * viewpoint_cam.Fx / pts_in_view_cam[:,2] + viewpoint_cam.Cx,
-                            pts_in_view_cam[:,1] * viewpoint_cam.Fy / pts_in_view_cam[:,2] + viewpoint_cam.Cy], -1).float()
+                            [pts_in_view_cam[:,0] * viewpoint_cam.Fx / (pts_in_view_cam[:,2] + 1e-8) + viewpoint_cam.Cx,
+                            pts_in_view_cam[:,1] * viewpoint_cam.Fy / (pts_in_view_cam[:,2] + 1e-8) + viewpoint_cam.Cy], -1).float()
                 pixel_noise = torch.norm(pts_projections - pixels.reshape(*pts_projections.shape), dim=-1)
                 if not opt.wo_use_geo_occ_aware:
                     d_mask = d_mask & (pixel_noise < pixel_noise_th)
@@ -354,7 +354,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         ref_local_d = ref_local_d.reshape(-1)[valid_indices]
                         H_ref_to_neareast = ref_to_neareast_r[None] - \
                             torch.matmul(ref_to_neareast_t[None,:,None].expand(ref_local_d.shape[0],3,1), 
-                                        ref_local_n[:,:,None].expand(ref_local_d.shape[0],3,1).permute(0, 2, 1))/ref_local_d[...,None,None]
+                                        ref_local_n[:,:,None].expand(ref_local_d.shape[0],3,1).permute(0, 2, 1))/(ref_local_d[...,None,None] + 1e-8)
                         H_ref_to_neareast = torch.matmul(nearest_cam.get_k(nearest_cam.ncc_scale)[None].expand(ref_local_d.shape[0], 3, 3), H_ref_to_neareast)
                         H_ref_to_neareast = H_ref_to_neareast @ viewpoint_cam.get_inv_k(viewpoint_cam.ncc_scale)
                         
@@ -382,9 +382,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * image_loss.item() + 0.6 * ema_loss_for_log
-            ema_single_view_for_log = 0.4 * normal_loss.item() if normal_loss is not None else 0.0 + 0.6 * ema_single_view_for_log
-            ema_multi_view_geo_for_log = 0.4 * geo_loss.item() if geo_loss is not None else 0.0 + 0.6 * ema_multi_view_geo_for_log
-            ema_multi_view_pho_for_log = 0.4 * ncc_loss.item() if ncc_loss is not None else 0.0 + 0.6 * ema_multi_view_pho_for_log
+            ema_single_view_for_log = 0.4 * (normal_loss.item() if normal_loss is not None else 0.0) + 0.6 * ema_single_view_for_log
+            ema_multi_view_geo_for_log = 0.4 * (geo_loss.item() if geo_loss is not None else 0.0) + 0.6 * ema_multi_view_geo_for_log
+            ema_multi_view_pho_for_log = 0.4 * (ncc_loss.item() if ncc_loss is not None else 0.0) + 0.6 * ema_multi_view_pho_for_log
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
