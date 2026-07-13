@@ -121,6 +121,9 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth = 0.1
         self.lambda_normal = 0.05
         
+        self.lambda_compactness = 0.01
+        self.lambda_max_scale = 5.0
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

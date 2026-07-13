@@ -228,6 +228,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sorted_scale, _ = torch.sort(scale, dim=-1)
             min_scale_loss = sorted_scale[...,0]
             loss += opt.scale_loss_weight * min_scale_loss.mean()
+
+        # Compactness Loss
+        if opt.lambda_compactness > 0:
+            scales = gaussians.get_scaling
+            opacities = gaussians.get_opacity
+            volume = torch.prod(scales, dim=1, keepdim=True)
+            compactness_loss = torch.mean(opacities * volume)
+            loss += opt.lambda_compactness * compactness_loss
+
+        # Max-Scale Regularization
+        if opt.lambda_max_scale > 0:
+            scales = gaussians.get_scaling
+            max_scales, _ = torch.max(scales, dim=1)
+            max_scale_loss = torch.mean(max_scales)
+            loss += opt.lambda_max_scale * max_scale_loss
+
         # single-view loss
         if iteration > opt.single_view_weight_from_iter:
             weight = opt.single_view_weight
