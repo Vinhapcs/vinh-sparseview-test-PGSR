@@ -101,6 +101,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     app_model.train()
     app_model.cuda()
     
+    camera_params = []
+    for cam in scene.getTrainCameras():
+        camera_params.append(cam.cam_trans_delta)
+        camera_params.append(cam.cam_rot_delta)
+    camera_optimizer = torch.optim.Adam(camera_params, lr=opt.camera_opt_lr)
+    
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -175,6 +181,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        if iteration < 1000:
+            viewpoint_cam.get_optimized_extrinsics()
+            camera_optimizer.zero_grad(set_to_none=True)
 
         gt_image, gt_image_gray = viewpoint_cam.get_image()
         if iteration > 1000 and opt.exposure_compensation:
@@ -455,6 +465,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 app_model.optimizer.step()
+                if iteration < 1000:
+                    camera_optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 app_model.optimizer.zero_grad(set_to_none = True)
 

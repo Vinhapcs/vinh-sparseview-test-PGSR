@@ -102,6 +102,46 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         self.plane_mask, self.non_plane_mask = None, None
+        
+        # Base poses for optimization
+        self.world_view_transform_base = self.world_view_transform.clone().detach()
+        self.cam_trans_delta = nn.Parameter(torch.zeros(3, requires_grad=True, device="cuda"))
+        self.cam_rot_delta = nn.Parameter(torch.zeros(3, requires_grad=True, device="cuda"))
+
+    def get_optimized_extrinsics(self):
+        theta = torch.norm(self.cam_rot_delta)
+        if theta > 1e-6:
+            k = self.cam_rot_delta / theta
+            K = torch.zeros((3, 3), dtype=torch.float32, device="cuda")
+            K[0, 1] = -k[2]
+            K[0, 2] = k[1]
+            K[1, 0] = k[2]
+            K[1, 2] = -k[0]
+            K[2, 0] = -k[1]
+            K[2, 1] = k[0]
+            R_delta = torch.eye(3, device="cuda") + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * torch.matmul(K, K)
+        else:
+            K = torch.zeros((3, 3), dtype=torch.float32, device="cuda")
+            K[0, 1] = -self.cam_rot_delta[2]
+            K[0, 2] = self.cam_rot_delta[1]
+            K[1, 0] = self.cam_rot_delta[2]
+            K[1, 2] = -self.cam_rot_delta[0]
+            K[2, 0] = -self.cam_rot_delta[1]
+            K[2, 1] = self.cam_rot_delta[0]
+            R_delta = torch.eye(3, device="cuda") + K
+
+        delta_transform = torch.eye(4, dtype=torch.float32, device="cuda")
+        delta_transform[:3, :3] = R_delta
+        delta_transform[3, :3] = self.cam_trans_delta
+
+        optimized_w2v = torch.matmul(self.world_view_transform_base, delta_transform)
+        optimized_full_proj = torch.matmul(optimized_w2v, self.projection_matrix)
+        optimized_center = torch.inverse(optimized_w2v)[3, :3]
+        
+        self.world_view_transform = optimized_w2v
+        self.full_proj_transform = optimized_full_proj
+        self.camera_center = optimized_center
+        return optimized_w2v, optimized_full_proj, optimized_center
 
     def get_image(self):
         if self.preload_img:

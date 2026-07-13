@@ -124,6 +124,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_compactness = 0.01
         self.lambda_max_scale = 5.0
         
+        self.camera_opt_lr = 1e-3
+        
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
