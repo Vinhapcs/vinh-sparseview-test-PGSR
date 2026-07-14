@@ -106,6 +106,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         camera_params.append(cam.cam_trans_delta)
         camera_params.append(cam.cam_rot_delta)
     camera_optimizer = torch.optim.Adam(camera_params, lr=opt.camera_opt_lr)
+    # Cosine LR decay: từ camera_opt_lr về camera_opt_lr_final trong coarse_iters iterations
+    camera_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        camera_optimizer,
+        T_max=max(opt.coarse_iters, 1),
+        eta_min=opt.camera_opt_lr_final
+    )
     
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -174,7 +180,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
         gaussians.update_learning_rate(iteration)
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        # Bỏ qua tại đúng ranh giới coarse/fine để tránh double disruption
+        if iteration % 1000 == 0 and iteration != opt.coarse_iters:
+            gaussians.oneupSHdegree()
+        # Tăng SH một lần sau khi kết thúc coarse phase (delay 500 iters)
+        elif iteration == opt.coarse_iters + 500:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -182,17 +192,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        if iteration < 1000:
+        in_coarse_phase = iteration < opt.coarse_iters
+        in_pose_warmup  = iteration < opt.pose_warmup_iters
+
+        if in_coarse_phase:
             viewpoint_cam.get_optimized_extrinsics()
             camera_optimizer.zero_grad(set_to_none=True)
-        elif iteration == 1000:
+        elif iteration == opt.coarse_iters:
+            # Kết thúc coarse phase: detach tất cả camera transforms khỏi computation graph
             for cam in scene.getTrainCameras():
                 cam.world_view_transform = cam.world_view_transform.detach()
-                cam.full_proj_transform = cam.full_proj_transform.detach()
-                cam.camera_center = cam.camera_center.detach()
+                cam.full_proj_transform  = cam.full_proj_transform.detach()
+                cam.camera_center        = cam.camera_center.detach()
 
         gt_image, gt_image_gray = viewpoint_cam.get_image()
-        if iteration > 1000 and opt.exposure_compensation:
+        if not in_coarse_phase and opt.exposure_compensation:
             gaussians.use_app = True
 
         # Render
@@ -214,6 +228,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1 = l1_loss(image, gt_image)
         image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         loss = image_loss.clone()
+        # ---- Coarse phase: biến cục bộ để điều phối loss ----
+        coarse_reg_disabled = in_coarse_phase and opt.coarse_disable_regularization
         
         # Normal Loss
         if opt.lambda_normal > 0 and viewpoint_cam.image_name in normal_priors:
@@ -225,12 +241,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=mask)
             
         # Depth Loss
+        # Depth prior là METRIC DEPTH từ MASt3R (không phải scale-invariant)
+        # → Coarse phase: dùng L1 metric loss để camera pose học đúng scale tuyệt đối
+        #   (PCC là scale-invariant nên bỏ lỡ thông tin metric quan trọng trong coarse)
+        # → Fine phase: dùng PCC (scale-invariant, robust hơn với residual pose error nhỏ)
         if opt.lambda_depth > 0 and viewpoint_cam.image_name in depth_priors:
             gt_depth = depth_priors[viewpoint_cam.image_name]
             rendered_depth = render_pkg["plane_depth"]
             if gt_depth.shape[1:] != rendered_depth.shape[1:]:
                 gt_depth = F.interpolate(gt_depth.unsqueeze(0), size=rendered_depth.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
-            loss += opt.lambda_depth * confidence_aware_pearson_loss(rendered_depth, gt_depth)
+            if in_coarse_phase:
+                # L1 metric loss: khai thác absolute scale của MASt3R depth
+                # Mask pixels không có stereo match hợp lệ (depth = 0)
+                valid_mask = (gt_depth > 0).float()
+                n_valid = valid_mask.sum().clamp(min=1.0)
+                metric_depth_loss = (torch.abs(rendered_depth - gt_depth) * valid_mask).sum() / n_valid
+                loss += opt.lambda_depth * opt.coarse_depth_weight_mult * metric_depth_loss
+            else:
+                # PCC: scale-invariant, robust hơn trong fine phase khi pose đã ổn định
+                loss += opt.lambda_depth * confidence_aware_pearson_loss(rendered_depth, gt_depth)
             
         # Flattening PGSR loss
         if opt.lambda_flatten > 0 and visibility_filter.sum() > 0:
@@ -238,14 +267,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += opt.lambda_flatten * smallest_scale.mean()
 
         # scale loss
-        if visibility_filter.sum() > 0:
+        # Disable trong coarse phase: không cần ép gaussian nhỏ khi pose chưa ổn định
+        if visibility_filter.sum() > 0 and not coarse_reg_disabled:
             scale = gaussians.get_scaling[visibility_filter]
             sorted_scale, _ = torch.sort(scale, dim=-1)
             min_scale_loss = sorted_scale[...,0]
             loss += opt.scale_loss_weight * min_scale_loss.mean()
 
         # Compactness Loss
-        if opt.lambda_compactness > 0:
+        # Disable trong coarse phase: volume regularization gây nhiễu cho pose optimization
+        if opt.lambda_compactness > 0 and not coarse_reg_disabled:
             scales = gaussians.get_scaling
             opacities = gaussians.get_opacity
             volume = torch.prod(scales, dim=1, keepdim=True)
@@ -253,11 +284,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += opt.lambda_compactness * compactness_loss
 
         # Max-Scale Regularization
-        if opt.lambda_max_scale > 0:
+        # Disable trong coarse phase: cho phép gaussian linh hoạt cover geometry
+        if opt.lambda_max_scale > 0 and not coarse_reg_disabled:
             scales = gaussians.get_scaling
             max_scales, _ = torch.max(scales, dim=1)
             max_scale_loss = torch.mean(max_scales)
             loss += opt.lambda_max_scale * max_scale_loss
+
+        # Pose Regularization (chỉ trong coarse phase)
+        # L2 penalty trên camera deltas để tránh pose drift quá xa khởi tạo
+        if in_coarse_phase and opt.camera_pose_reg_weight > 0:
+            pose_reg_loss = opt.camera_pose_reg_weight * (
+                viewpoint_cam.cam_rot_delta.pow(2).sum() +
+                viewpoint_cam.cam_trans_delta.pow(2).sum()
+            )
+            loss += pose_reg_loss
 
         # single-view loss
         if iteration > opt.single_view_weight_from_iter:
@@ -282,7 +323,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 nearest_cam = gen_virtul_cam(viewpoint_cam, trans_noise=dataset.multi_view_max_dis, deg_noise=dataset.multi_view_max_angle)
                 use_virtul_cam = True
             if nearest_cam is not None:
-                if not use_virtul_cam and iteration < 1000:
+                if not use_virtul_cam and in_coarse_phase:
                     nearest_cam.get_optimized_extrinsics()
                 patch_size = opt.multi_view_patch_size
                 sample_num = opt.multi_view_sample_num
@@ -470,12 +511,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
+                # Pose warmup: trong pose_warmup_iters đầu, chỉ optimize camera
+                # Gaussian vẫn forward nhưng không update weights → camera có tín hiệu sạch hơn
+                if not in_pose_warmup:
+                    gaussians.optimizer.step()
                 app_model.optimizer.step()
-                if iteration < 1000:
+                if in_coarse_phase:
                     camera_optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-                app_model.optimizer.zero_grad(set_to_none = True)
+                    camera_scheduler.step()  # Cosine decay LR camera
+                gaussians.optimizer.zero_grad(set_to_none=True)
+                app_model.optimizer.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))

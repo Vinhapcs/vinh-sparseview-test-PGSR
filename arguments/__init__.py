@@ -125,6 +125,14 @@ class OptimizationParams(ParamGroup):
         self.lambda_max_scale = 5.0
         
         self.camera_opt_lr = 1e-3
+
+        # --- Coarse Optimization (Gaussian Scenes / InstantSplat style) ---
+        self.coarse_iters = 1000                # Số iters cho coarse joint optimization (camera + gaussian)
+        self.pose_warmup_iters = 200            # Iters đầu chỉ optimize camera pose, freeze gaussian
+        self.camera_opt_lr_final = 1e-5         # Final lr cho camera optimizer (cosine decay về đây)
+        self.camera_pose_reg_weight = 0.01      # L2 regularization weight cho camera deltas (tránh drift)
+        self.coarse_depth_weight_mult = 3.0     # Bội số nhân với lambda_depth trong coarse phase
+        self.coarse_disable_regularization = True  # Tắt scale/compactness/max_scale reg trong coarse phase
         
         super().__init__(parser, "Optimization Parameters")
 
