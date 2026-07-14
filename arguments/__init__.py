@@ -133,6 +133,7 @@ class OptimizationParams(ParamGroup):
         self.camera_pose_reg_weight = 0.01      # L2 regularization weight cho camera deltas (tránh drift)
         self.coarse_depth_weight_mult = 3.0     # Bội số nhân với lambda_depth trong coarse phase
         self.coarse_disable_regularization = True  # Tắt scale/compactness/max_scale reg trong coarse phase
+        self.coarse_disable_densification = True   # Tắt ADC trong coarse (GScenes: MASt3R đã dense đủ)
         
         super().__init__(parser, "Optimization Parameters")
 

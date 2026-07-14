@@ -121,6 +121,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         "multi_view_weight_from_iter", opt.multi_view_weight_from_iter, opt.iterations)
     opt.densify_until_iter = _auto_scale(
         "densify_until_iter", opt.densify_until_iter, opt.iterations)
+    opt.opacity_reset_interval = _auto_scale(
+        "opacity_reset_interval", opt.opacity_reset_interval, opt.iterations)
     # position_lr_max_steps ảnh hưởng tới Gaussian LR decay: phải khớp với total iters
     if opt.position_lr_max_steps > opt.iterations:
         print(f"[AutoScale] position_lr_max_steps: {opt.position_lr_max_steps} → {opt.iterations}  (total_iters={opt.iterations})")
@@ -263,8 +265,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ---- Coarse phase: biến cục bộ để điều phối loss ----
         coarse_reg_disabled = in_coarse_phase and opt.coarse_disable_regularization
         
-        # Normal Loss
-        if opt.lambda_normal > 0 and viewpoint_cam.image_name in normal_priors:
+        # Normal Prior Loss
+        # KHÔNG áp dụng trong coarse phase: normals từ camera với pose sai sẽ cho gradient
+        # ngược chiều với việc sửa pose, gây mâu thuẫn tối ưu hóa.
+        # Paper GScenes: coarse phase CHỈ dùng photometric loss + depth metric.
+        if opt.lambda_normal > 0 and viewpoint_cam.image_name in normal_priors and not in_coarse_phase:
             gt_normal = normal_priors[viewpoint_cam.image_name]
             rendered_normals = render_pkg["rendered_normal"]
             if gt_normal.shape[1:] != rendered_normals.shape[1:]:
@@ -512,14 +517,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
                     
             # Densification
+            # KHÔNG chạy trong coarse phase theo GScenes paper:
+            # MASt3R cung cấp dense point cloud (1.5-3M điểm) → không cần ADC.
+            # Densify với pose sai → Gaussians được đặt sai vị trí → khó converge hơn.
+            coarse_no_densify = in_coarse_phase and opt.coarse_disable_densification
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                mask = (render_pkg["out_observe"] > 0) & visibility_filter
-                gaussians.max_radii2D[mask] = torch.max(gaussians.max_radii2D[mask], radii[mask])
-                viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
-                gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
+                if not coarse_no_densify:
+                    # Chỉ tích lũy gradient stats khi densification được phép
+                    # (tránh contaminate densify decisions sau coarse bằng noisy gradients)
+                    mask = (render_pkg["out_observe"] > 0) & visibility_filter
+                    gaussians.max_radii2D[mask] = torch.max(gaussians.max_radii2D[mask], radii[mask])
+                    viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
+                    gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if not coarse_no_densify and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.densify_abs_grad_threshold, 
                                                 opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)
