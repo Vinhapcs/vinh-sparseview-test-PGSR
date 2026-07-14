@@ -185,6 +185,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if iteration < 1000:
             viewpoint_cam.get_optimized_extrinsics()
             camera_optimizer.zero_grad(set_to_none=True)
+        elif iteration == 1000:
+            for cam in scene.getTrainCameras():
+                cam.world_view_transform = cam.world_view_transform.detach()
+                cam.full_proj_transform = cam.full_proj_transform.detach()
+                cam.camera_center = cam.camera_center.detach()
 
         gt_image, gt_image_gray = viewpoint_cam.get_image()
         if iteration > 1000 and opt.exposure_compensation:
@@ -277,6 +282,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 nearest_cam = gen_virtul_cam(viewpoint_cam, trans_noise=dataset.multi_view_max_dis, deg_noise=dataset.multi_view_max_angle)
                 use_virtul_cam = True
             if nearest_cam is not None:
+                if not use_virtul_cam and iteration < 1000:
+                    nearest_cam.get_optimized_extrinsics()
                 patch_size = opt.multi_view_patch_size
                 sample_num = opt.multi_view_sample_num
                 pixel_noise_th = opt.multi_view_pixel_noise_th
