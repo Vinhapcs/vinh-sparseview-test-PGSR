@@ -97,6 +97,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
+    # ============================================================
+    # AUTO-SCALE iteration thresholds to total training budget
+    # Defaults trong arguments/__init__.py được thiết kế cho 30,000 iters.
+    # Nếu train ngắn hơn (e.g., 3,000 iters), các loss chống overfitting
+    # (single_view, multi_view) sẽ KHÔNG BAO GIỜ được kích hoạt → test PSNR giảm.
+    # ============================================================
+    _REF_ITERS = 30_000  # Giá trị tham chiếu mà default parameters được thiết kế
+
+    def _auto_scale(name, current_val, total_iters, ref_iters=_REF_ITERS):
+        """Trả về giá trị scaled nếu current_val >= total_iters (tức là không bao giờ kích hoạt)."""
+        if current_val >= total_iters:
+            scaled = max(1, int(round(current_val * total_iters / ref_iters)))
+            # Đảm bảo không vượt quá total_iters - 1
+            scaled = min(scaled, total_iters - 1)
+            print(f"[AutoScale] {name}: {current_val} → {scaled}  (total_iters={total_iters})")
+            return scaled
+        return current_val
+
+    opt.single_view_weight_from_iter = _auto_scale(
+        "single_view_weight_from_iter", opt.single_view_weight_from_iter, opt.iterations)
+    opt.multi_view_weight_from_iter = _auto_scale(
+        "multi_view_weight_from_iter", opt.multi_view_weight_from_iter, opt.iterations)
+    opt.densify_until_iter = _auto_scale(
+        "densify_until_iter", opt.densify_until_iter, opt.iterations)
+    # position_lr_max_steps ảnh hưởng tới Gaussian LR decay: phải khớp với total iters
+    if opt.position_lr_max_steps > opt.iterations:
+        print(f"[AutoScale] position_lr_max_steps: {opt.position_lr_max_steps} → {opt.iterations}  (total_iters={opt.iterations})")
+        opt.position_lr_max_steps = opt.iterations
+        gaussians.training_setup(opt)   # Re-setup với LR schedule đúng
+    # ============================================================
+
+
     app_model = AppModel()
     app_model.train()
     app_model.cuda()
