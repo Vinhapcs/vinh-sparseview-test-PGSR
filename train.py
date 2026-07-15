@@ -379,17 +379,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss.backward()
 
-        # InstantSplat Step 3: Confidence-aware Gradient Scaling
-        # Scale gradients BEFORE optimizer.step() so high-confidence points move less
-        # and low-confidence points are free to self-correct their positions.
+        # InstantSplat Step 3: Confidence-aware Gradient Scaling (xyz ONLY)
+        # Only scale xyz gradients — geometry is what MASt3R knows best and should be preserved.
+        # _scaling and _rotation (shape/appearance) MUST remain free to optimize for all points.
+        # Clamp to [0.1, 1.0] so even high-confidence points retain 10% gradient flow.
         if gaussians.confidence_lr_mult is not None:
             with torch.no_grad():
                 if gaussians._xyz.grad is not None:
-                    gaussians._xyz.grad *= gaussians.confidence_lr_mult
-                if gaussians._scaling.grad is not None:
-                    gaussians._scaling.grad *= gaussians.confidence_lr_mult
-                if gaussians._rotation.grad is not None:
-                    gaussians._rotation.grad *= gaussians.confidence_lr_mult
+                    clamped_mult = gaussians.confidence_lr_mult.clamp(0.1, 1.0)
+                    gaussians._xyz.grad *= clamped_mult
 
         iter_end.record()
 
