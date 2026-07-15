@@ -188,7 +188,7 @@ class GaussianModel:
         raw_normals = np.asarray(pcd.normals)  # Shape: (N, 3)
         if raw_normals is not None and raw_normals.shape[0] == fused_point_cloud.shape[0] and np.any(raw_normals[:, 0] != 0):
             confidences = torch.tensor(raw_normals[:, 0:1], dtype=torch.float, device="cuda")  # (N, 1)
-            beta = 0.5  # Gentle nudge: high-conf → mult≈0.025 reduction; combined with clamp(0.1,1.0) in train.py
+            beta = 2.0  # Correct: medium-conf→mult=1.0 (normal), low-conf→mult≈1.9 (boosted), high-conf→mult≈0.1 (locked)
             lr_multipliers = (1.0 - torch.sigmoid(confidences)) * beta
             print(f"[InstantSplat] Loaded confidence-aware LR multipliers. "
                   f"Mean mult: {lr_multipliers.mean().item():.4f}, "
