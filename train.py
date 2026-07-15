@@ -378,6 +378,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             loss += ncc_loss
 
         loss.backward()
+
+        # InstantSplat Step 3: Confidence-aware Gradient Scaling
+        # Scale gradients BEFORE optimizer.step() so high-confidence points move less
+        # and low-confidence points are free to self-correct their positions.
+        if gaussians.confidence_lr_mult is not None:
+            with torch.no_grad():
+                if gaussians._xyz.grad is not None:
+                    gaussians._xyz.grad *= gaussians.confidence_lr_mult
+                if gaussians._scaling.grad is not None:
+                    gaussians._scaling.grad *= gaussians.confidence_lr_mult
+                if gaussians._rotation.grad is not None:
+                    gaussians._rotation.grad *= gaussians.confidence_lr_mult
+
         iter_end.record()
 
         with torch.no_grad():

@@ -73,6 +73,8 @@ class GaussianModel:
         self.knn_idx = None
         self.setup_functions()
         self.use_app = False
+        # InstantSplat: per-point LR multiplier from MASt3R confidence (N, 1), cuda
+        self.confidence_lr_mult = None
 
     def capture(self):
         return (
@@ -179,6 +181,23 @@ class GaussianModel:
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        # InstantSplat Step 2: Extract MASt3R confidence hidden in normals[:,0] (nx field)
+        # Formula: lr_mult = (1 - sigmoid(conf)) * beta
+        # High-confidence points -> lr_mult near 0 (locked), low-confidence -> lr_mult near beta (free to move)
+        raw_normals = np.asarray(pcd.normals)  # Shape: (N, 3)
+        if raw_normals is not None and raw_normals.shape[0] == fused_point_cloud.shape[0] and np.any(raw_normals[:, 0] != 0):
+            confidences = torch.tensor(raw_normals[:, 0:1], dtype=torch.float, device="cuda")  # (N, 1)
+            beta = 2.0
+            lr_multipliers = (1.0 - torch.sigmoid(confidences)) * beta
+            print(f"[InstantSplat] Loaded confidence-aware LR multipliers. "
+                  f"Mean mult: {lr_multipliers.mean().item():.4f}, "
+                  f"Min: {lr_multipliers.min().item():.4f}, Max: {lr_multipliers.max().item():.4f}")
+        else:
+            # Fallback: all points treated equally (multiplier = 1.0) when no confidence data
+            lr_multipliers = torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
+            print("[InstantSplat] No confidence data found in normals. Using uniform LR multiplier = 1.0")
+        self.confidence_lr_mult = lr_multipliers  # (N, 1), non-trainable
 
         dist = torch.sqrt(torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001))
         # print(f"new scale {torch.quantile(dist, 0.1)}")
@@ -314,6 +333,8 @@ class GaussianModel:
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
+        # InstantSplat: when loading from checkpoint, confidence data is gone; use neutral multiplier
+        self.confidence_lr_mult = torch.ones((xyz.shape[0], 1), dtype=torch.float, device="cuda")
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -369,6 +390,10 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.max_weight = self.max_weight[valid_points_mask]
 
+        # InstantSplat: keep confidence_lr_mult in sync with point count after pruning
+        if self.confidence_lr_mult is not None:
+            self.confidence_lr_mult = self.confidence_lr_mult[valid_points_mask]
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -414,6 +439,11 @@ class GaussianModel:
         self.denom_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # InstantSplat: newly spawned points get neutral multiplier = 1.0 (free to move)
+        if self.confidence_lr_mult is not None:
+            new_mults = torch.ones((new_xyz.shape[0], 1), dtype=torch.float, device="cuda")
+            self.confidence_lr_mult = torch.cat([self.confidence_lr_mult, new_mults], dim=0)
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, max_radii2D, N=2):
         n_init_points = self.get_xyz.shape[0]
