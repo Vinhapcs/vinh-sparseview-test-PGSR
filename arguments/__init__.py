@@ -100,7 +100,7 @@ class OptimizationParams(ParamGroup):
 
         self.use_virtul_cam = False
         self.virtul_cam_prob = 0.5
-        self.use_multi_view_trim = True
+        self.use_multi_view_trim = False
         self.multi_view_ncc_weight = 0.15
         self.multi_view_geo_weight = 0.03
         self.multi_view_weight_from_iter = 7000
