@@ -199,7 +199,11 @@ class GaussianModel:
             print("[InstantSplat] No confidence data found in normals. Using uniform LR multiplier = 1.0")
         self.confidence_lr_mult = lr_multipliers  # (N, 1), non-trainable
 
-        dist = torch.sqrt(torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001))
+        # distCUDA2 in some newer simple_knn extensions returns (distances, indices) tuple
+        dist2 = distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda())
+        if isinstance(dist2, tuple):
+            dist2 = dist2[0]
+        dist = torch.sqrt(torch.clamp_min(dist2, 0.0000001))
         # print(f"new scale {torch.quantile(dist, 0.1)}")
         scales = torch.log(dist)[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
