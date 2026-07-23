@@ -92,7 +92,7 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
-        self.scale_loss_weight = 1000.0
+        self.scale_loss_weight = 100.0
         
         self.wo_image_weight = False
         self.single_view_weight = 0.015
@@ -117,7 +117,7 @@ class OptimizationParams(ParamGroup):
         self.exposure_compensation = False
         self.random_background = False
 
-        self.lambda_flatten = 10.0
+        self.lambda_flatten = 1.0
         self.lambda_depth = 1.0
         self.lambda_normal = 0.5
         
