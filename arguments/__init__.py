@@ -93,6 +93,9 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.scale_loss_weight = 100.0
+        # FIX 2: Delay scale loss until this iteration to allow Gaussians to spread first.
+        # Enabling scale loss too early combined with lambda_flatten causes needles/spikes.
+        self.scale_loss_start_iter = 3000
         
         self.wo_image_weight = False
         self.single_view_weight = 0.015

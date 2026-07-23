@@ -223,7 +223,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += opt.lambda_flatten * smallest_scale.mean()
 
         # scale loss
-        if visibility_filter.sum() > 0:
+        # FIX 2: Only apply after scale_loss_start_iter (default 3000) to avoid
+        # conflicting with lambda_flatten in early training \u2014 causing needles/spikes.
+        if visibility_filter.sum() > 0 and iteration > opt.scale_loss_start_iter:
             scale = gaussians.get_scaling[visibility_filter]
             sorted_scale, _ = torch.sort(scale, dim=-1)
             min_scale_loss = sorted_scale[...,0]
@@ -353,31 +355,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         # ref_local_d = ref_local_d.reshape(*render_pkg['plane_depth'].shape)
 
                         ref_local_d = ref_local_d.reshape(-1)[valid_indices]
-                        H_ref_to_neareast = ref_to_neareast_r[None] - \
-                            torch.matmul(ref_to_neareast_t[None,:,None].expand(ref_local_d.shape[0],3,1), 
-                                        ref_local_n[:,:,None].expand(ref_local_d.shape[0],3,1).permute(0, 2, 1))/(ref_local_d[...,None,None] + 1e-8)
-                        H_ref_to_neareast = torch.matmul(nearest_cam.get_k(nearest_cam.ncc_scale)[None].expand(ref_local_d.shape[0], 3, 3), H_ref_to_neareast)
-                        H_ref_to_neareast = H_ref_to_neareast @ viewpoint_cam.get_inv_k(viewpoint_cam.ncc_scale)
-                        
-                        ## compute neareast frame patch
-                        grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
-                        grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
-                        grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
-                        _, nearest_image_gray = nearest_cam.get_image()
-                        sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
-                        sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
-                        
-                        ## compute loss
-                        ncc, ncc_mask = lncc(ref_gray_val, sampled_gray_val)
-                        mask = ncc_mask.reshape(-1)
-                        ncc = ncc.reshape(-1) * weights
-                        ncc = ncc[mask].squeeze()
 
-                        if mask.sum() > 0:
-                            ncc_loss = ncc_weight * ncc.mean()
-                            loss += ncc_loss
+                        # === FIX 1: Mask out textureless & sky (near-zero depth) patches ===
+                        # Reason: Homography formula H = R - t*nᵀ/d explodes when d≈0 (no Gaussian in sky).
+                        # Patches in homogeneous regions (sky, white walls) have near-zero variance,
+                        # making NCC numerically undefined (0/0) and injecting corrupted gradients.
+                        DEPTH_VALID_THRESHOLD  = 0.1   # pixels with rendered_distance < 0.1 are sky/unobserved
+                        TEXTURE_VAR_THRESHOLD  = 1e-4  # patches with variance < this are textureless
+                        with torch.no_grad():
+                            depth_valid_mask   = ref_local_d > DEPTH_VALID_THRESHOLD
+                            # ref_gray_val shape: (N, total_patch_size); compute per-patch variance
+                            patch_var          = ref_gray_val.var(dim=-1)               # (N,)
+                            texture_valid_mask = patch_var > TEXTURE_VAR_THRESHOLD
+                            combined_valid     = depth_valid_mask & texture_valid_mask   # (N,)
 
-        loss.backward()
+                        if combined_valid.sum() == 0:
+                            pass  # no valid patches after filtering — skip NCC for this iteration
+                        else:
+                            ref_local_n      = ref_local_n[combined_valid]
+                            ref_local_d      = ref_local_d[combined_valid]
+                            ref_gray_val     = ref_gray_val[combined_valid]
+                            weights_ncc      = weights[combined_valid]
+                            ori_pixels_patch = ori_pixels_patch[combined_valid]
+                        # ================================================================
+
+                            H_ref_to_neareast = ref_to_neareast_r[None] - \
+                                torch.matmul(ref_to_neareast_t[None,:,None].expand(ref_local_d.shape[0],3,1), 
+                                            ref_local_n[:,:,None].expand(ref_local_d.shape[0],3,1).permute(0, 2, 1))/(ref_local_d[...,None,None] + 1e-8)
+                            H_ref_to_neareast = torch.matmul(nearest_cam.get_k(nearest_cam.ncc_scale)[None].expand(ref_local_d.shape[0], 3, 3), H_ref_to_neareast)
+                            H_ref_to_neareast = H_ref_to_neareast @ viewpoint_cam.get_inv_k(viewpoint_cam.ncc_scale)
+                            
+                            ## compute neareast frame patch
+                            grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
+                            grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
+                            grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
+                            _, nearest_image_gray = nearest_cam.get_image()
+                            sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
+                            sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
+                            
+                            ## compute loss
+                            ncc, ncc_mask = lncc(ref_gray_val, sampled_gray_val)
+                            mask = ncc_mask.reshape(-1)
+                            ncc = ncc.reshape(-1) * weights_ncc
+                            ncc = ncc[mask].squeeze()
+
+                            if mask.sum() > 0:
+                                ncc_loss = ncc_weight * ncc.mean()
+                                loss += ncc_loss
+
+        # === FIX 3: 2-phase backward for clean densification gradient stats ===
+        # Problem: Calling loss.backward() once mixes all auxiliary losses (scale, NCC, normal)
+        # into viewspace_point_tensor.grad, which is then used to decide densification.
+        # This causes Gaussians in empty/sky regions to receive spurious large gradients
+        # from NCC/depth errors → they cross densify_grad_threshold → floaters explode.
+        # Solution: Backward image_loss first (retain_graph=True), capture clean viewspace grads
+        # for densification immediately, THEN backward the auxiliary losses.
+        image_loss.backward(retain_graph=True)
+
+        # Capture densification stats NOW from the clean image-only gradient:
+        with torch.no_grad():
+            if iteration < opt.densify_until_iter:
+                obs_mask = (render_pkg["out_observe"] > 0) & visibility_filter
+                gaussians.max_radii2D[obs_mask] = torch.max(
+                    gaussians.max_radii2D[obs_mask], radii[obs_mask])
+                viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
+                gaussians.add_densification_stats(
+                    viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
+
+        # Now backward the remaining auxiliary losses (does not pollute densification stats):
+        aux_loss = loss - image_loss
+        if aux_loss.abs().item() > 0:
+            aux_loss.backward()
+        # =====================================================================
 
         # InstantSplat Step 3: Confidence-aware Gradient Scaling (xyz ONLY)
         # Multiplier from beta=2.0 formula: medium-conf=1.0, low-conf≈1.9 (boost), high-conf≈0.1 (lock)
@@ -415,15 +464,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
                     
             # Densification
+            # NOTE: max_radii2D accumulation and add_densification_stats are now called
+            # in the 2-phase backward block above (from clean image_loss gradients only).
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                mask = (render_pkg["out_observe"] > 0) & visibility_filter
-                gaussians.max_radii2D[mask] = torch.max(gaussians.max_radii2D[mask], radii[mask])
-                viewspace_point_tensor_abs = render_pkg["viewspace_points_abs"]
-                gaussians.add_densification_stats(viewspace_point_tensor, viewspace_point_tensor_abs, visibility_filter)
-
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    # === FIX 4: Prune large-screen Gaussians early (from densify_from_iter=500) ===
+                    # Original code waited until opacity_reset_interval=3000, meaning sky floaters
+                    # could grow unchecked for the first 3000 iterations.
+                    size_threshold = 20 if iteration > opt.densify_from_iter else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.densify_abs_grad_threshold, 
                                                 opt.opacity_cull_threshold, scene.cameras_extent, size_threshold)
             
