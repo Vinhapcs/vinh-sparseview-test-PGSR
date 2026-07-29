@@ -92,21 +92,26 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
-        self.scale_loss_weight = 100.0
-        # FIX 2: Delay scale loss until this iteration to allow Gaussians to spread first.
-        # Enabling scale loss too early combined with lambda_flatten causes needles/spikes.
-        self.scale_loss_start_iter = 3000
-        
-        self.wo_image_weight = False
-        self.single_view_weight = 0.015
-        self.single_view_weight_from_iter = 7000
 
+        # ── [ABLATION: scale_loss] min-scale regularization ──────────────────
+        # Original: 100.0 — aggressive push to flatten Gaussians via sorted scale.
+        # Disabled here to isolate core PGSR (lambda_flatten already handles this).
+        self.scale_loss_weight = 0.0        # [ABLATION] original: 100.0
+        self.scale_loss_start_iter = 3000   # [ABLATION] delay to avoid needles+spikes with lambda_flatten
+
+        # ── [ABLATION: single_view] image-gradient-weighted normal consistency ─
+        # Aligns rendered normals with depth-derived normals on textureless regions.
+        self.wo_image_weight = False
+        self.single_view_weight = 0.0                    # [ABLATION] original: 0.015
+        self.single_view_weight_from_iter = 999_999_999  # [ABLATION] original: 7000 — set to never trigger
+
+        # ── [ABLATION: multi_view] geometric + NCC photometric consistency ────
         self.use_virtul_cam = False
         self.virtul_cam_prob = 0.5
         self.use_multi_view_trim = False
-        self.multi_view_ncc_weight = 0.15
-        self.multi_view_geo_weight = 0.03
-        self.multi_view_weight_from_iter = 7000
+        self.multi_view_ncc_weight = 0.0                 # [ABLATION] original: 0.15
+        self.multi_view_geo_weight = 0.0                 # [ABLATION] original: 0.03
+        self.multi_view_weight_from_iter = 999_999_999   # [ABLATION] original: 7000 — set to never trigger
         self.multi_view_patch_size = 3
         self.multi_view_sample_num = 102400
         self.multi_view_pixel_noise_th = 1.0
@@ -117,12 +122,13 @@ class OptimizationParams(ParamGroup):
         self.abs_split_radii2D_threshold = 20
         self.max_abs_split_points = 50_000
         self.max_all_points = 6000_000
-        self.exposure_compensation = False
+        self.exposure_compensation = False   # [ABLATION: app_model] original: False (keep as-is)
         self.random_background = False
 
-        self.lambda_flatten = 1.0
-        self.lambda_depth = 1.0
-        self.lambda_normal = 0.5
+        # ── Core PGSR losses ─────────────────────────────────────────────────
+        self.lambda_flatten = 1.0   # ACTIVE — flattening loss, core of PGSR (§3.2)
+        self.lambda_depth = 0.0     # [ABLATION: depth_prior] original: 1.0
+        self.lambda_normal = 0.0    # [ABLATION: normal_prior] original: 0.5
         
         super().__init__(parser, "Optimization Parameters")
 
