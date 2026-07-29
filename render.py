@@ -155,13 +155,27 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
             path = os.path.join(dataset.model_path, "mesh")
             os.makedirs(path, exist_ok=True)
-            
+
+            n_tri = len(np.asarray(mesh.triangles))
+            print(f"Extracted mesh: {n_tri:,} triangles")
+
             o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion.ply"), mesh, 
                                        write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
-            
-            mesh = post_process_mesh(mesh, num_cluster)
-            o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion_post.ply"), mesh, 
+
+            # ClusterConnectedTriangles is very slow on large meshes (millions of triangles).
+            # Use fast path (simple cleanup) when mesh exceeds threshold.
+            CLUSTER_TRI_LIMIT = 500_000
+            if n_tri > CLUSTER_TRI_LIMIT:
+                print(f"Mesh too large ({n_tri:,} > {CLUSTER_TRI_LIMIT:,}) — using fast post-process (skip cluster).")
+                mesh_post = copy.deepcopy(mesh)
+                mesh_post.remove_degenerate_triangles()
+                mesh_post.remove_unreferenced_vertices()
+            else:
+                mesh_post = post_process_mesh(mesh, num_cluster)
+
+            o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion_post.ply"), mesh_post, 
                                        write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
+            print(f"Saved post-processed mesh: {len(np.asarray(mesh_post.triangles)):,} triangles")
 
         if not skip_test:
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), scene, gaussians, pipeline, background)
