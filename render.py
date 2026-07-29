@@ -82,7 +82,6 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
         _, H, W = rendering.shape
 
         depth = out["plane_depth"].squeeze()
-        depth_tsdf = depth.clone()
         depth = depth.detach().cpu().numpy()
         depth_i = (depth - depth.min()) / (depth.max() - depth.min() + 1e-20)
         depth_i = (depth_i * 255).clip(0, 255).astype(np.uint8)
@@ -98,16 +97,19 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
         cv2.imwrite(os.path.join(render_depth_path, view.image_name + ".jpg"), depth_color)
         cv2.imwrite(os.path.join(render_normal_path, view.image_name + ".jpg"), normal)
 
-        if use_depth_filter:
-            view_dir = torch.nn.functional.normalize(view.get_rays(), p=2, dim=-1)
-            depth_normal = out["depth_normal"].permute(1,2,0)
-            depth_normal = torch.nn.functional.normalize(depth_normal, p=2, dim=-1)
-            dot = torch.sum(view_dir*depth_normal, dim=-1).abs()
-            angle = torch.acos(dot)
-            mask = angle > (80.0 / 180 * 3.14159)
-            depth_tsdf[mask] = 0
-        depths_tsdf_fusion.append(depth_tsdf.squeeze().cpu())
-        
+        # Only accumulate depth for TSDF when a volume is provided
+        if volume is not None:
+            depth_tsdf = out["plane_depth"].squeeze().clone()
+            if use_depth_filter:
+                view_dir = torch.nn.functional.normalize(view.get_rays(), p=2, dim=-1)
+                depth_normal = out["depth_normal"].permute(1,2,0)
+                depth_normal = torch.nn.functional.normalize(depth_normal, p=2, dim=-1)
+                dot = torch.sum(view_dir*depth_normal, dim=-1).abs()
+                angle = torch.acos(dot)
+                mask = angle > (80.0 / 180 * 3.14159)
+                depth_tsdf[mask] = 0
+            depths_tsdf_fusion.append(depth_tsdf.squeeze().cpu())
+
     if volume is not None:
         depths_tsdf_fusion = torch.stack(depths_tsdf_fusion, dim=0)
         for idx, view in enumerate(tqdm(views, desc="TSDF Fusion progress")):
@@ -117,21 +119,21 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
                 ref_depth[view.mask.squeeze() < 0.5] = 0
             ref_depth[ref_depth>max_depth] = 0
             ref_depth = ref_depth.detach().cpu().numpy()
-            
+
             pose = np.identity(4)
             pose[:3,:3] = view.R.transpose(-1,-2)
             pose[:3, 3] = view.T
             color = o3d.io.read_image(os.path.join(render_path, view.image_name + ".png"))
-            depth = o3d.geometry.Image((ref_depth*1000).astype(np.uint16))
+            depth_img = o3d.geometry.Image((ref_depth*1000).astype(np.uint16))
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                color, depth, depth_scale=1000.0, depth_trunc=max_depth, convert_rgb_to_intensity=False)
+                color, depth_img, depth_scale=1000.0, depth_trunc=max_depth, convert_rgb_to_intensity=False)
             volume.integrate(
                 rgbd,
                 o3d.camera.PinholeCameraIntrinsic(W, H, view.Fx, view.Fy, view.Cx, view.Cy),
                 pose)
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool,
-                 max_depth : float, voxel_size : float, num_cluster: int, use_depth_filter : bool):
+                 max_depth : float, voxel_size : float, num_cluster: int, use_depth_filter : bool, skip_mesh : bool = False):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -142,40 +144,48 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        volume = o3d.pipelines.integration.ScalableTSDFVolume(
-            voxel_length=voxel_size,
-            sdf_trunc=4.0*voxel_size,
-            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+
+        # Only create TSDF volume when mesh extraction is needed
+        if not skip_mesh:
+            volume = o3d.pipelines.integration.ScalableTSDFVolume(
+                voxel_length=voxel_size,
+                sdf_trunc=4.0*voxel_size,
+                color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+        else:
+            volume = None
+            print("[skip_mesh] Skipping TSDF volume and mesh extraction.")
 
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), scene, gaussians, pipeline, background, 
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), scene, gaussians, pipeline, background,
                        max_depth=max_depth, volume=volume, use_depth_filter=use_depth_filter)
-            print(f"extract_triangle_mesh")
-            mesh = volume.extract_triangle_mesh()
 
-            path = os.path.join(dataset.model_path, "mesh")
-            os.makedirs(path, exist_ok=True)
+            if not skip_mesh:
+                print(f"extract_triangle_mesh")
+                mesh = volume.extract_triangle_mesh()
 
-            n_tri = len(np.asarray(mesh.triangles))
-            print(f"Extracted mesh: {n_tri:,} triangles")
+                path = os.path.join(dataset.model_path, "mesh")
+                os.makedirs(path, exist_ok=True)
 
-            o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion.ply"), mesh, 
-                                       write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
+                n_tri = len(np.asarray(mesh.triangles))
+                print(f"Extracted mesh: {n_tri:,} triangles")
 
-            # ClusterConnectedTriangles is very slow on large meshes (millions of triangles).
-            # Use fast path (simple cleanup) when mesh exceeds threshold.
-            CLUSTER_TRI_LIMIT = 500_000
-            if n_tri > CLUSTER_TRI_LIMIT:
-                print(f"Mesh too large ({n_tri:,} > {CLUSTER_TRI_LIMIT:,}) — using fast post-process (skip cluster).")
-                mesh_post = copy.deepcopy(mesh)
-                mesh_post.remove_degenerate_triangles()
-                mesh_post.remove_unreferenced_vertices()
-            else:
-                mesh_post = post_process_mesh(mesh, num_cluster)
+                o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion.ply"), mesh,
+                                           write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
 
-            o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion_post.ply"), mesh_post, 
-                                       write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
-            print(f"Saved post-processed mesh: {len(np.asarray(mesh_post.triangles)):,} triangles")
+                # ClusterConnectedTriangles is very slow on large meshes (millions of triangles).
+                # Use fast path (simple cleanup) when mesh exceeds threshold.
+                CLUSTER_TRI_LIMIT = 500_000
+                if n_tri > CLUSTER_TRI_LIMIT:
+                    print(f"Mesh too large ({n_tri:,} > {CLUSTER_TRI_LIMIT:,}) — using fast post-process (skip cluster).")
+                    mesh_post = copy.deepcopy(mesh)
+                    mesh_post.remove_degenerate_triangles()
+                    mesh_post.remove_unreferenced_vertices()
+                else:
+                    mesh_post = post_process_mesh(mesh, num_cluster)
+
+                o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion_post.ply"), mesh_post,
+                                           write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
+                print(f"Saved post-processed mesh: {len(np.asarray(mesh_post.triangles)):,} triangles")
 
         if not skip_test:
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), scene, gaussians, pipeline, background)
@@ -194,6 +204,8 @@ if __name__ == "__main__":
     parser.add_argument("--voxel_size", default=0.002, type=float)
     parser.add_argument("--num_cluster", default=1, type=int)
     parser.add_argument("--use_depth_filter", action="store_true")
+    parser.add_argument("--skip_mesh", action="store_true",
+                        help="Skip TSDF fusion and mesh extraction. Only save RGB, depth, and normal images.")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -201,4 +213,4 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
     print(f"multi_view_num {model.multi_view_num}")
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.max_depth, args.voxel_size, args.num_cluster, args.use_depth_filter)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.max_depth, args.voxel_size, args.num_cluster, args.use_depth_filter, args.skip_mesh)
