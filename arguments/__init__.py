@@ -127,7 +127,7 @@ class OptimizationParams(ParamGroup):
 
         # ── Core PGSR losses ─────────────────────────────────────────────────
         self.lambda_flatten = 1.0   # ACTIVE — flattening loss, core of PGSR (§3.2)
-        self.lambda_depth = 0.0     # [ABLATION: depth_prior] original: 1.0
+        self.lambda_depth = 1.0     # [ABLATION: depth_prior] ACTIVE — original: 1.0
         self.lambda_normal = 0.0    # [ABLATION: normal_prior] original: 0.5
         
         super().__init__(parser, "Optimization Parameters")

@@ -25,7 +25,8 @@ from utils.image_utils import psnr
 # from utils.image_utils import erode
 
 # [ABLATION: normal_prior / depth_prior] confidence-aware losses
-# from utils.loss_utils import confidence_aware_normal_loss, confidence_aware_pearson_loss
+# from utils.loss_utils import confidence_aware_normal_loss  # [ABLATION: normal_prior]
+from utils.loss_utils import confidence_aware_pearson_loss   # [ABLATION: depth_prior] ACTIVE
 
 # [ABLATION: multi_view] NCC + patch warping utilities
 # from utils.loss_utils import lncc
@@ -155,18 +156,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     #     print(f"Loaded {len(normal_priors)} normal priors.")
 
     # [ABLATION: depth_prior] load per-image monocular depth maps from disk
-    # depth_priors = {}
-    # depths_dir = os.path.join(dataset.source_path, "depths")
-    # if os.path.exists(depths_dir):
-    #     print("Loading depth priors...")
-    #     for fname in os.listdir(depths_dir):
-    #         if fname.endswith(".npy"):
-    #             cam_name = fname.split('.')[0]
-    #             dmap = np.load(os.path.join(depths_dir, fname))
-    #             if len(dmap.shape) == 2:
-    #                 dmap = dmap[np.newaxis, ...]
-    #             depth_priors[cam_name] = torch.tensor(dmap).cuda().float()
-    #     print(f"Loaded {len(depth_priors)} depth priors.")
+    depth_priors = {}
+    depths_dir = os.path.join(dataset.source_path, "depths")
+    if os.path.exists(depths_dir):
+        print("Loading depth priors...")
+        for fname in os.listdir(depths_dir):
+            if fname.endswith(".npy"):
+                cam_name = fname.split('.')[0]
+                dmap = np.load(os.path.join(depths_dir, fname))
+                if len(dmap.shape) == 2:
+                    dmap = dmap[np.newaxis, ...]
+                depth_priors[cam_name] = torch.tensor(dmap).cuda().float()
+        print(f"Loaded {len(depth_priors)} depth priors.")
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -268,12 +269,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=mask)
 
         # [ABLATION: depth_prior] confidence-aware depth (Pearson correlation) supervision
-        # if opt.lambda_depth > 0 and viewpoint_cam.image_name in depth_priors:
-        #     gt_depth = depth_priors[viewpoint_cam.image_name]
-        #     rendered_depth = render_pkg["plane_depth"]
-        #     if gt_depth.shape[1:] != rendered_depth.shape[1:]:
-        #         gt_depth = F.interpolate(gt_depth.unsqueeze(0), size=rendered_depth.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
-        #     loss += opt.lambda_depth * confidence_aware_pearson_loss(rendered_depth, gt_depth)
+        if opt.lambda_depth > 0 and viewpoint_cam.image_name in depth_priors:
+            gt_depth = depth_priors[viewpoint_cam.image_name]
+            rendered_depth = render_pkg["plane_depth"]
+            if gt_depth.shape[1:] != rendered_depth.shape[1:]:
+                gt_depth = F.interpolate(gt_depth.unsqueeze(0), size=rendered_depth.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
+            loss += opt.lambda_depth * confidence_aware_pearson_loss(rendered_depth, gt_depth)
 
         # [ABLATION: scale_loss] min-scale regularization (separate from flatten, stronger push)
         # if visibility_filter.sum() > 0 and iteration > opt.scale_loss_start_iter:
