@@ -265,18 +265,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Fixes applied:
         #   1. rendered_alpha as confidence → masks sky/empty pixels
         #   2. lambda_normal_from_iter → delay start until Gaussians stabilize
-        #   3. OpenGL -> COLMAP coordinate transform for GT normals (Y and Z flip)
-        #      (Omnidata outputs Z>0 for front-facing surfaces, PGSR's rendered_normal has Z<0)
+        # (Note: GT normals are assumed to be already pre-processed into COLMAP space)
         if opt.lambda_normal > 0 and iteration > opt.lambda_normal_from_iter \
            and viewpoint_cam.image_name in normal_priors:
-            gt_normal = normal_priors[viewpoint_cam.image_name].clone()
+            gt_normal = normal_priors[viewpoint_cam.image_name]
             rendered_normals = render_pkg["rendered_normal"]
             rendered_alpha = render_pkg["rendered_alpha"]
-            
-            # Coordinate transform: Omnidata (OpenGL: X Right, Y Up, Z Backward/Towards Viewer) 
-            # -> PGSR (COLMAP: X Right, Y Down, Z Forward/Into Scene)
-            gt_normal[1] = -gt_normal[1]  # Flip Y (Up -> Down)
-            gt_normal[2] = -gt_normal[2]  # Flip Z (Backward -> Forward)
             
             if gt_normal.shape[1:] != rendered_normals.shape[1:]:
                 gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=rendered_normals.shape[1:],

@@ -205,11 +205,7 @@ def confidence_aware_normal_loss(pred_normal, gt_normal, conf):
     cosine_sim = torch.nn.functional.cosine_similarity(pred_normal, gt_normal, dim=0)
     loss_cos = (1.0 - cosine_sim)
     
-    # L1 distance
-    loss_l1 = torch.abs(pred_normal - gt_normal).sum(dim=0)
-    
-    # Combine (Pi-Gaussian / MonoGS style)
-    loss = (loss_cos + loss_l1) * conf.squeeze(0)
+    loss = loss_cos * conf.squeeze(0)
     return loss.mean()
 
 try:
