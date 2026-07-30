@@ -161,6 +161,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "radii": radii,
                     "out_observe": out_observe,
                     "rendered_normal": rendered_normal,
+                    "rendered_alpha": rendered_alpha,   # Gaussian coverage ∈[0,1], used as depth confidence mask
                     "plane_depth": plane_depth,
                     "rendered_distance": rendered_distance
                     }

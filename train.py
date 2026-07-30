@@ -26,7 +26,7 @@ from utils.image_utils import psnr
 
 # [ABLATION: normal_prior / depth_prior] confidence-aware losses
 # from utils.loss_utils import confidence_aware_normal_loss  # [ABLATION: normal_prior]
-from utils.loss_utils import confidence_aware_pearson_loss   # [ABLATION: depth_prior] ACTIVE
+from utils.loss_utils import confidence_aware_pearson_loss, align_depth_ls  # [ABLATION: depth_prior] ACTIVE
 
 # [ABLATION: multi_view] NCC + patch warping utilities
 # from utils.loss_utils import lncc
@@ -269,12 +269,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=mask)
 
         # [ABLATION: depth_prior] confidence-aware depth (Pearson correlation) supervision
-        if opt.lambda_depth > 0 and viewpoint_cam.image_name in depth_priors:
+        # Fixes applied:
+        #   1. rendered_alpha as confidence → masks sky/empty pixels (no Gaussian coverage)
+        #   2. align_depth_ls → scale-shift alignment before loss (plane_depth ≠ z-depth units)
+        #   3. lambda_depth_from_iter → delay start until Gaussians stabilize
+        if opt.lambda_depth > 0 and iteration > opt.lambda_depth_from_iter \
+           and viewpoint_cam.image_name in depth_priors:
             gt_depth = depth_priors[viewpoint_cam.image_name]
             rendered_depth = render_pkg["plane_depth"]
+            rendered_alpha = render_pkg["rendered_alpha"]
             if gt_depth.shape[1:] != rendered_depth.shape[1:]:
-                gt_depth = F.interpolate(gt_depth.unsqueeze(0), size=rendered_depth.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
-            loss += opt.lambda_depth * confidence_aware_pearson_loss(rendered_depth, gt_depth)
+                gt_depth = F.interpolate(gt_depth.unsqueeze(0), size=rendered_depth.shape[1:],
+                                         mode='bilinear', align_corners=False).squeeze(0)
+            # Confidence mask: pixels where Gaussians cover the surface (alpha > 0.5)
+            # This naturally excludes sky, background, and unobserved regions.
+            valid_mask = (rendered_alpha.squeeze() > 0.5).float()
+            # Scale-shift align plane_depth → GT depth domain (handles unit mismatch)
+            rendered_depth_aligned = align_depth_ls(rendered_depth, gt_depth,
+                                                    mask=valid_mask.unsqueeze(0) > 0.5)
+            confidence = valid_mask.unsqueeze(0)
+            loss += opt.lambda_depth * confidence_aware_pearson_loss(
+                rendered_depth_aligned, gt_depth, confidence=confidence)
 
         # [ABLATION: scale_loss] min-scale regularization (separate from flatten, stronger push)
         # if visibility_filter.sum() > 0 and iteration > opt.scale_loss_start_iter:

@@ -140,6 +140,39 @@ def lncc(ref, nea):
     mask = (ncc < 0.9)
     return ncc, mask
 
+def align_depth_ls(pred, gt, mask=None):
+    """
+    Least-squares scale-shift alignment: finds scalar a, b such that gt ≈ a*pred + b.
+    Operates only on valid (masked) pixels to avoid sky/invalid contamination.
+    Returns the aligned pred depth (same shape as input pred).
+
+    Args:
+        pred: rendered depth tensor, any shape
+        gt:   monocular GT depth tensor, same shape as pred
+        mask: bool/float tensor, same shape. True/1 = valid pixel. None = all valid.
+    """
+    if mask is None:
+        mask = torch.ones_like(pred, dtype=torch.bool)
+    valid = mask.bool().view(-1)
+
+    pred_flat = pred.detach().view(-1)[valid].unsqueeze(1)   # (N, 1)
+    gt_flat   = gt.detach().view(-1)[valid].unsqueeze(1)     # (N, 1)
+
+    if pred_flat.numel() < 2:
+        return pred  # not enough valid pixels — skip alignment
+
+    A = torch.cat([pred_flat, torch.ones_like(pred_flat)], dim=1)  # (N, 2)
+    try:
+        result = torch.linalg.lstsq(A, gt_flat)
+        a = result.solution[0].squeeze()
+        b = result.solution[1].squeeze()
+        a = torch.clamp(a, min=1e-3)   # depth scale must be positive
+    except Exception:
+        a = torch.tensor(1.0, device=pred.device)
+        b = torch.tensor(0.0, device=pred.device)
+
+    return a * pred + b
+
 def confidence_aware_pearson_loss(pred_depth, gt_depth, confidence=None):
     if confidence is None:
         confidence = torch.ones_like(pred_depth)
