@@ -25,7 +25,7 @@ from utils.image_utils import psnr
 # from utils.image_utils import erode
 
 # [ABLATION: normal_prior / depth_prior] confidence-aware losses
-# from utils.loss_utils import confidence_aware_normal_loss  # [ABLATION: normal_prior]
+from utils.loss_utils import confidence_aware_normal_loss               # [ABLATION: normal_prior] ACTIVE
 from utils.loss_utils import confidence_aware_pearson_loss, align_depth_ls  # [ABLATION: depth_prior] ACTIVE
 
 # [ABLATION: multi_view] NCC + patch warping utilities
@@ -142,18 +142,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     # [ABLATION: normal_prior] load per-image monocular normal maps from disk
-    # normal_priors = {}
-    # normals_dir = os.path.join(dataset.source_path, "normals")
-    # if os.path.exists(normals_dir):
-    #     print("Loading normal priors...")
-    #     for fname in os.listdir(normals_dir):
-    #         if fname.endswith(".npy"):
-    #             cam_name = fname.split('.')[0]
-    #             nmap = np.load(os.path.join(normals_dir, fname))
-    #             if nmap.shape[-1] == 3:
-    #                 nmap = np.transpose(nmap, (2, 0, 1))
-    #             normal_priors[cam_name] = torch.tensor(nmap).cuda().float()
-    #     print(f"Loaded {len(normal_priors)} normal priors.")
+    # NOTE: GT normals must be in CAMERA SPACE, CHW format, values in [-1, 1].
+    # Most monocular estimators (Omnidata, StableNormal) output in camera space by default.
+    normal_priors = {}
+    normals_dir = os.path.join(dataset.source_path, "normals")
+    if os.path.exists(normals_dir):
+        print("Loading normal priors...")
+        for fname in os.listdir(normals_dir):
+            if fname.endswith(".npy"):
+                cam_name = fname.split('.')[0]
+                nmap = np.load(os.path.join(normals_dir, fname))
+                if nmap.shape[-1] == 3:
+                    nmap = np.transpose(nmap, (2, 0, 1))  # HWC → CHW
+                normal_priors[cam_name] = torch.tensor(nmap).cuda().float()
+        print(f"Loaded {len(normal_priors)} normal priors.")
 
     # [ABLATION: depth_prior] load per-image monocular depth maps from disk
     depth_priors = {}
@@ -260,13 +262,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += opt.lambda_flatten * smallest_scale.mean()
 
         # [ABLATION: normal_prior] confidence-aware normal supervision from monocular priors
-        # if opt.lambda_normal > 0 and viewpoint_cam.image_name in normal_priors:
-        #     gt_normal = normal_priors[viewpoint_cam.image_name]
-        #     rendered_normals = render_pkg["rendered_normal"]
-        #     if gt_normal.shape[1:] != rendered_normals.shape[1:]:
-        #         gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=rendered_normals.shape[1:], mode='bilinear', align_corners=False).squeeze(0)
-        #     mask = viewpoint_cam.original_image[0:1]*0 + 1.0
-        #     loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=mask)
+        # Fixes applied:
+        #   1. rendered_alpha as confidence → masks sky/empty pixels (original mask was constant 1)
+        #   2. lambda_normal_from_iter → delay start until Gaussians stabilize
+        # ASSUMPTION: GT normals in `normals/` are in CAMERA SPACE, CHW, values in [-1, 1].
+        #             rendered_normal is also in camera space (from gaussian_renderer).
+        #             If your estimator outputs world-space normals, add camera rotation transform here.
+        if opt.lambda_normal > 0 and iteration > opt.lambda_normal_from_iter \
+           and viewpoint_cam.image_name in normal_priors:
+            gt_normal = normal_priors[viewpoint_cam.image_name]
+            rendered_normals = render_pkg["rendered_normal"]
+            rendered_alpha = render_pkg["rendered_alpha"]
+            if gt_normal.shape[1:] != rendered_normals.shape[1:]:
+                gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=rendered_normals.shape[1:],
+                                          mode='bilinear', align_corners=False).squeeze(0)
+            # Confidence: only supervise where Gaussians cover the surface (alpha > 0.5).
+            # Replaces original (buggy) mask = original_image[0:1]*0 + 1.0 (constant 1 everywhere).
+            conf = (render_pkg["rendered_alpha"].squeeze() > 0.5).float().unsqueeze(0)
+            loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=conf)
 
         # [ABLATION: depth_prior] confidence-aware depth (Pearson correlation) supervision
         # Fixes applied:
