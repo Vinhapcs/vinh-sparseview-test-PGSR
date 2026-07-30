@@ -130,7 +130,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth = 0.05    # [ABLATION: depth_prior] ACTIVE — reduced from 1.0 (too dominant)
         self.lambda_depth_from_iter = 1000  # [ABLATION: depth_prior] delay start until Gaussians stabilize
         self.lambda_normal = 0.5    # [ABLATION: normal_prior] ACTIVE — original: 0.5
-        self.lambda_normal_from_iter = 1000  # [ABLATION: normal_prior] delay start until Gaussians stabilize
+        self.lambda_normal_from_iter = 1000  # [ABLATION: normal_prior] delay start
         
         super().__init__(parser, "Optimization Parameters")
 

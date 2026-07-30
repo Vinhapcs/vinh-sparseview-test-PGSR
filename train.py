@@ -263,22 +263,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # [ABLATION: normal_prior] confidence-aware normal supervision from monocular priors
         # Fixes applied:
-        #   1. rendered_alpha as confidence → masks sky/empty pixels (original mask was constant 1)
+        #   1. rendered_alpha as confidence → masks sky/empty pixels
         #   2. lambda_normal_from_iter → delay start until Gaussians stabilize
-        # ASSUMPTION: GT normals in `normals/` are in CAMERA SPACE, CHW, values in [-1, 1].
-        #             rendered_normal is also in camera space (from gaussian_renderer).
-        #             If your estimator outputs world-space normals, add camera rotation transform here.
+        #   3. OpenGL -> COLMAP coordinate transform for GT normals (Y and Z flip)
+        #      (Omnidata outputs Z>0 for front-facing surfaces, PGSR's rendered_normal has Z<0)
         if opt.lambda_normal > 0 and iteration > opt.lambda_normal_from_iter \
            and viewpoint_cam.image_name in normal_priors:
-            gt_normal = normal_priors[viewpoint_cam.image_name]
+            gt_normal = normal_priors[viewpoint_cam.image_name].clone()
             rendered_normals = render_pkg["rendered_normal"]
             rendered_alpha = render_pkg["rendered_alpha"]
+            
+            # Coordinate transform: Omnidata (OpenGL: X Right, Y Up, Z Backward/Towards Viewer) 
+            # -> PGSR (COLMAP: X Right, Y Down, Z Forward/Into Scene)
+            gt_normal[1] = -gt_normal[1]  # Flip Y (Up -> Down)
+            gt_normal[2] = -gt_normal[2]  # Flip Z (Backward -> Forward)
+            
             if gt_normal.shape[1:] != rendered_normals.shape[1:]:
                 gt_normal = F.interpolate(gt_normal.unsqueeze(0), size=rendered_normals.shape[1:],
                                           mode='bilinear', align_corners=False).squeeze(0)
-            # Confidence: only supervise where Gaussians cover the surface (alpha > 0.5).
-            # Replaces original (buggy) mask = original_image[0:1]*0 + 1.0 (constant 1 everywhere).
-            conf = (render_pkg["rendered_alpha"].squeeze() > 0.5).float().unsqueeze(0)
+            
+            # Confidence: only supervise where Gaussians cover the surface (alpha > 0.5)
+            conf = (rendered_alpha.squeeze() > 0.5).float().unsqueeze(0)
             loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=conf)
 
         # [ABLATION: depth_prior] confidence-aware depth (Pearson correlation) supervision
