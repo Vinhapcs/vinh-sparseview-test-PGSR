@@ -246,51 +246,37 @@ def interpolate_camera_on_circle(cam_src, cam_tgt, cam_ref, t):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. Backward RGB warping via grid_sample  (no holes, bilinear, Pi-GS §3.6)
+# 5. Forward RGB warping with Z-buffer and confidence masking
 # ──────────────────────────────────────────────────────────────────────────────
 
 def warp_image_rgb(src_cam, pseudo_cam, depth_map, rgb_image,
                    conf_map=None, conf_threshold=0.2):
     """
-    Warp `rgb_image` from `src_cam` into `pseudo_cam` using `depth_map`.
+    Forward-warp `rgb_image` from `src_cam` into `pseudo_cam` using
+    `depth_map` for 3D reprojection.  Applies a confidence mask and resolves
+    depth-order conflicts with a Z-buffer (smallest depth wins).
 
-    Strategy — BACKWARD warping with F.grid_sample (bilinear):
-        For each pixel (u_t, v_t) in pseudo-cam space we find which source
-        pixel it corresponds to by:
-          1. Backproject source pixels → 3D world using plane_depth.
-          2. Project 3D → pseudo-cam to build a dense "flow" from
-             source pixels to target pixels.
-          3. Invert the flow: build a target→source sampling grid by
-             scattering source UV coords into target pixel locations
-             (Z-buffer for occlusion).
-          4. Call F.grid_sample on the source image using this grid.
-             Pixels where no source hit exists remain masked.
-
-    Benefits over forward scatter-only:
-        • Bilinear interpolation → smooth, sub-pixel accurate warped image.
-        • Same Z-buffer occlusion handling.
-        • No need for further in-painting (valid_mask tells you where to supervise).
-
-    Camera convention (PGSR row-vector):
-        pts_cam = pts_world @ R + T
+    Camera convention (PGSR, row vectors):
+        pts_cam   = pts_world @ R + T
         pts_world = (pts_cam − T) @ R.T
 
     Args:
-        src_cam:        source Camera object
+        src_cam:        source Camera object (PGSR Camera)
         pseudo_cam:     target pseudo-Camera (from interpolate_camera_on_circle)
         depth_map:      [H, W] float tensor — rendered plane depth from src_cam
-        rgb_image:      [3, H, W] float tensor — GT RGB at src_cam ∈ [0,1]
-        conf_map:       [1,H,W] | [H,W] | None — per-pixel confidence ∈ [0,1]
-        conf_threshold: exclude pixels with conf < threshold
+        rgb_image:      [3, H, W] float tensor — GT RGB at src_cam, values in [0,1]
+        conf_map:       [1,H,W] | [H,W] | None — per-pixel confidence in [0,1]
+                        (e.g. rendered_alpha).  None ≡ all pixels confident.
+        conf_threshold: pixels with conf < threshold are excluded from warping
 
     Returns:
-        warped_rgb:  [3, H, W] float tensor (bilinear-sampled, 0 where invalid)
-        valid_mask:  [H, W] bool tensor (True where a source pixel was mapped)
+        warped_rgb:  [3, H, W] float tensor (0 where no valid projection hit)
+        valid_mask:  [H, W] bool tensor    (True where at least one src pixel hit)
     """
     H, W   = depth_map.shape
     device = depth_map.device
 
-    # ── Intrinsics (same for both cameras — Pi-GS assumption) ────────────────
+    # ── Source intrinsics (assume same for pseudo-cam — Pi-GS §3.6) ─────────
     fx    = float(src_cam.image_width  / (2.0 * math.tan(src_cam.FoVx / 2.0)))
     fy    = float(src_cam.image_height / (2.0 * math.tan(src_cam.FoVy / 2.0)))
     cx_px = W / 2.0
@@ -298,47 +284,46 @@ def warp_image_rgb(src_cam, pseudo_cam, depth_map, rgb_image,
 
     # ── Confidence mask ──────────────────────────────────────────────────────
     if conf_map is not None:
-        conf_mask_2d = conf_map.squeeze().to(device) >= conf_threshold   # [H, W]
+        conf_mask = (conf_map.squeeze().to(device) >= conf_threshold).reshape(-1)
     else:
-        conf_mask_2d = torch.ones(H, W, dtype=torch.bool, device=device)
+        conf_mask = torch.ones(H * W, dtype=torch.bool, device=device)
 
-    # ── Pixel grid (source camera) ───────────────────────────────────────────
+    # ── Pixel grid ───────────────────────────────────────────────────────────
     yy, xx = torch.meshgrid(
         torch.arange(H, device=device, dtype=torch.float32),
         torch.arange(W, device=device, dtype=torch.float32),
         indexing='ij',
-    )  # [H, W]
+    )  # both [H, W]
 
-    # ── Backproject source pixels → 3D world ─────────────────────────────────
-    d     = depth_map                                      # [H, W]
-    X_c   = (xx - cx_px) * d / fx
-    Y_c   = (yy - cy_px) * d / fy
+    # ── Backproject: image pixel → src camera space ──────────────────────────
+    d    = depth_map                               # [H, W]
+    X_c  = (xx - cx_px) * d / fx
+    Y_c  = (yy - cy_px) * d / fy
     pts_c = torch.stack([X_c, Y_c, d], dim=-1).reshape(-1, 3)  # [N, 3]
 
-    # Camera → World: pts_w = (pts_c − T) @ R.T
-    src_R = torch.tensor(src_cam.R, device=device, dtype=torch.float32)
-    src_T = torch.tensor(src_cam.T, device=device, dtype=torch.float32)
-    pts_w = (pts_c - src_T.unsqueeze(0)) @ src_R.transpose(0, 1)  # [N, 3]
+    # ── Src camera → world: pts_w = (pts_c − T) @ R.T ───────────────────────
+    src_R = torch.tensor(src_cam.R,  device=device, dtype=torch.float32)  # [3,3]
+    src_T = torch.tensor(src_cam.T,  device=device, dtype=torch.float32)  # [3]
+    pts_w = (pts_c - src_T.unsqueeze(0)) @ src_R.transpose(0, 1)          # [N, 3]
 
-    # ── World → Pseudo-cam ────────────────────────────────────────────────────
+    # ── World → target camera: pts_tgt = pts_w @ R_tgt + T_tgt ─────────────
     tgt_R = torch.tensor(pseudo_cam.R, device=device, dtype=torch.float32)
     tgt_T = torch.tensor(pseudo_cam.T, device=device, dtype=torch.float32)
-    pts_t = pts_w @ tgt_R + tgt_T.unsqueeze(0)            # [N, 3]
+    pts_tgt = pts_w @ tgt_R + tgt_T.unsqueeze(0)                          # [N, 3]
 
-    Xt, Yt, Zt = pts_t[:, 0], pts_t[:, 1], pts_t[:, 2]
+    Xt, Yt, Zt = pts_tgt[:, 0], pts_tgt[:, 1], pts_tgt[:, 2]
 
-    # ── Project to target image coords ───────────────────────────────────────
-    u_t = Xt * fx / (Zt + 1e-8) + cx_px    # [N] float pixel coords in target
+    # ── Project to target image plane ────────────────────────────────────────
+    u_t = Xt * fx / (Zt + 1e-8) + cx_px
     v_t = Yt * fy / (Zt + 1e-8) + cy_px
 
-    # ── Source-pixel validity ─────────────────────────────────────────────────
-    depth_flat    = d.reshape(-1)
-    conf_mask_flat = conf_mask_2d.reshape(-1)
+    # ── Validity filter ───────────────────────────────────────────────────────
+    depth_flat = d.reshape(-1)
     valid = (
         (Zt > 0.01) &
         (u_t >= 0.0) & (u_t <= W - 1.0) &
         (v_t >= 0.0) & (v_t <= H - 1.0) &
-        conf_mask_flat &
+        conf_mask &
         (depth_flat > 0.01)
     )  # [N] bool
 
@@ -348,57 +333,32 @@ def warp_image_rgb(src_cam, pseudo_cam, depth_map, rgb_image,
             torch.zeros(H, W, dtype=torch.bool, device=device),
         )
 
-    u_v     = u_t[valid].long()
-    v_v     = v_t[valid].long()
-    Z_v     = Zt[valid]
-    src_idx = torch.where(valid)[0]           # source flat indices  [M]
-    tgt_idx = v_v * W + u_v                  # target flat indices  [M]
+    u_v      = u_t[valid].long()
+    v_v      = v_t[valid].long()
+    Z_v      = Zt[valid]
+    src_idx  = torch.where(valid)[0]      # flat source indices  [M]
+    tgt_idx  = v_v * W + u_v             # flat target indices  [M]
 
-    # ── Z-buffer: smallest depth wins — build target→source UV lookup ─────────
-    sort_idx      = torch.argsort(Z_v, descending=True)   # paint large first
+    # ── Z-buffer (smallest depth wins) ───────────────────────────────────────
+    # Paint in descending depth order → the last write (smallest Z) survives.
+    sort_idx = torch.argsort(Z_v, descending=True)
+
     out_depth     = torch.full((H * W,), float('inf'), device=device)
-    # Store source UV coords (float) at each target pixel
-    src_u_map     = torch.zeros(H * W, device=device)
-    src_v_map     = torch.zeros(H * W, device=device)
-    valid_hit     = torch.zeros(H * W, dtype=torch.bool, device=device)
+    surviving_src = torch.zeros(H * W,  dtype=torch.long,  device=device)
 
-    # Source pixel coordinates (float, for sub-pixel bilinear sampling)
-    src_u_all = xx.reshape(-1)[valid]   # [M] float
-    src_v_all = yy.reshape(-1)[valid]   # [M] float
+    out_depth.scatter_(0,     tgt_idx[sort_idx], Z_v[sort_idx])
+    surviving_src.scatter_(0, tgt_idx[sort_idx], src_idx[sort_idx])
 
-    out_depth.scatter_(0,  tgt_idx[sort_idx], Z_v[sort_idx])
-    src_u_map.scatter_(0,  tgt_idx[sort_idx], src_u_all[sort_idx])
-    src_v_map.scatter_(0,  tgt_idx[sort_idx], src_v_all[sort_idx])
-    valid_hit.scatter_(0,  tgt_idx[sort_idx],
-                       torch.ones(len(sort_idx), dtype=torch.bool, device=device))
+    valid_tgt     = out_depth < float('inf')           # [H*W] bool
+    valid_tgt_idx = torch.where(valid_tgt)[0]          # [M'] target flat indices
+    src_gather    = surviving_src[valid_tgt_idx]       # [M'] source flat indices
 
-    valid_mask = valid_hit.reshape(H, W)      # [H, W] bool
+    # ── Gather source colors ──────────────────────────────────────────────────
+    rgb_flat    = rgb_image.reshape(3, -1)             # [3, H*W]
+    warped_flat = torch.zeros(3, H * W, device=device)
+    warped_flat[:, valid_tgt_idx] = rgb_flat[:, src_gather]
 
-    # ── Build grid_sample sampling grid (target → source) ────────────────────
-    # grid_sample expects grid in [-1, 1] at each target pixel
-    # grid[v_t, u_t] = (norm_u_src, norm_v_src)
-    norm_u = (src_u_map / (W - 1.0)) * 2.0 - 1.0   # [H*W]
-    norm_v = (src_v_map / (H - 1.0)) * 2.0 - 1.0
-    sample_grid = torch.stack([norm_u, norm_v], dim=-1).reshape(1, H, W, 2)  # [1,H,W,2]
+    warped_rgb = warped_flat.reshape(3, H, W)
+    valid_mask = valid_tgt.reshape(H, W)
 
-    # ── Sample source image ───────────────────────────────────────────────────
-    warped = F.grid_sample(
-        rgb_image.unsqueeze(0),      # [1, 3, H, W]
-        sample_grid,                 # [1, H, W, 2]
-        mode='bilinear',
-        padding_mode='zeros',
-        align_corners=True,
-    ).squeeze(0)                     # [3, H, W]
-
-    # Zero-out pixels where no valid source hit exists
-    warped = warped * valid_mask.unsqueeze(0).float()
-
-    return warped, valid_mask
-
-
-def coverage_ratio(valid_mask):
-    """
-    Return fraction of target pixels that have a valid source hit.
-    Used to decide if a pseudo-view has enough supervision signal.
-    """
-    return valid_mask.float().mean().item()
+    return warped_rgb, valid_mask

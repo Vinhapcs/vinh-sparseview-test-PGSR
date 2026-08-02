@@ -138,8 +138,8 @@ class OptimizationParams(ParamGroup):
         # supervises the Gaussian render at that pseudo-view with L1 + SSIM.
         # Weight = 0.1 as specified in Pi-GS §3.6.
         self.lambda_depth_warp = 0.1             # loss weight (Pi-GS: 0.1)
-        self.lambda_depth_warp_from_iter = 3000  # delay: wait until geometry stabilises
-        self.depth_warp_conf_threshold = 0.2     # rendered_alpha threshold (0.2 = permissive)
+        self.lambda_depth_warp_from_iter = 1000  # delay start (let Gaussians stabilise)
+        self.depth_warp_conf_threshold = 0.5     # rendered_alpha threshold for conf mask
 
         super().__init__(parser, "Optimization Parameters")
 
