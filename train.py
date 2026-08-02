@@ -29,7 +29,8 @@ from utils.image_utils import psnr
 from utils.loss_utils import confidence_aware_pearson_loss, align_depth_ls  # [ABLATION: depth_prior] ACTIVE
 
 # [Pi-GS §3.6: depth_warp] pseudo-view supervision via circle-interpolated cameras
-from utils.warp_utils import find_nearest_cameras, interpolate_camera_on_circle, warp_image_rgb
+from utils.warp_utils import find_nearest_cameras, interpolate_camera_on_circle, \
+                             warp_image_rgb, coverage_ratio
 
 # [ABLATION: multi_view] NCC + patch warping utilities
 # from utils.loss_utils import lncc
@@ -316,12 +317,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             _plane_depth = render_pkg["plane_depth"].squeeze().detach()  # [H, W]
             _gt_rgb, _   = viewpoint_cam.get_image()              # [3, H, W]
 
-            # Two pseudo-cameras on the circle:
-            #   A: midpoint between nearest_1 and current  (ref = nearest_2)
-            #   B: midpoint between current and nearest_2  (ref = nearest_1)
+            # Two pseudo-cameras on the circumscribed circle:
+            #   A: 1/3 between nearest_1 and current  (ref = nearest_2)
+            #   B: 2/3 between current and nearest_2  (ref = nearest_1)
+            # Using t=0.33/0.67 instead of 0.5 keeps pseudo-views closer to
+            # the source — critical for sparse cameras that are far apart
+            # (fewer occlusions → higher coverage → stronger supervision signal).
             _warp_pairs = [
-                (_cam_n1, viewpoint_cam, _cam_n2, 0.5),
-                (viewpoint_cam, _cam_n2, _cam_n1, 0.5),
+                (_cam_n1, viewpoint_cam, _cam_n2, 0.33),
+                (viewpoint_cam, _cam_n2, _cam_n1, 0.33),
             ]
 
             _warp_loss_acc = torch.tensor(0.0, device="cuda")
@@ -339,6 +343,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     )
 
                     if _valid_mask.sum() < 100:   # skip if too few valid pixels
+                        continue
+
+                    # Skip pseudo-view if coverage is too low (< 15% of image)
+                    # Low coverage means too many occlusions → noisy supervision
+                    if coverage_ratio(_valid_mask) < 0.15:
                         continue
 
                     # Render Gaussians at pseudo-view (no grad through warping)
