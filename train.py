@@ -29,7 +29,8 @@ from utils.image_utils import psnr
 from utils.loss_utils import confidence_aware_pearson_loss, align_depth_ls  # [ABLATION: depth_prior] ACTIVE
 
 # [Pi-GS §3.6: depth_warp] pseudo-view supervision via circle-interpolated cameras
-from utils.warp_utils import find_nearest_cameras, interpolate_camera_on_circle, warp_image_rgb
+from utils.warp_utils import (find_nearest_cameras, interpolate_camera_on_circle,
+                               warp_image_rgb, plane_depth_to_z_depth)
 
 # [ABLATION: multi_view] NCC + patch warping utilities
 # from utils.loss_utils import lncc
@@ -189,6 +190,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             print("[depth_warp] Skipped: need >= 3 training cameras for circle interpolation.")
 
+    # [Pi-GS §3.6: depth_warp] runtime cache of each camera's z_depth + GT image.
+    # Populated lazily during the training loop as cameras appear as the main viewpoint.
+    # Used by the warp block to fill holes in pseudo-GT from the neighbour side.
+    depth_warp_cache = {}   # {cam.uid → {'z_depth': [H,W], 'gt_image': [3,H,W]}}
+
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     # [ABLATION: single_view / multi_view] EMA trackers for aux losses
@@ -263,6 +269,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image_loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
         loss = image_loss.clone()
 
+        # [depth_warp] cache current camera's z_depth for neighbour hole-filling.
+        # Must be done AFTER the main render so we have rendered_normal + plane_depth.
+        # Uses PGSR Camera class attributes (Fx, Fy, Cx, Cy) directly.
+        if nearest_cams_dict and 'rendered_normal' in render_pkg:
+            depth_warp_cache[viewpoint_cam.uid] = {
+                'z_depth': plane_depth_to_z_depth(
+                    render_pkg['plane_depth'].squeeze().detach(),
+                    render_pkg['rendered_normal'].detach(),
+                    viewpoint_cam.Fx, viewpoint_cam.Fy,
+                    viewpoint_cam.Cx, viewpoint_cam.Cy,
+                ).clone(),
+                'gt_image': gt_image.detach().clone(),
+            }
+
         # [ABLATION: app_model] use appearance-corrected image for L1 when SSIM is good
         # ssim_loss = (1.0 - ssim(image, gt_image))
         # if 'app_image' in render_pkg and ssim_loss < 0.5:
@@ -299,71 +319,102 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     loss += opt.lambda_normal * confidence_aware_normal_loss(rendered_normals, gt_normal, conf=conf)
 
         # [Pi-GS §3.6: depth_warp] pseudo-view supervision via circle-interpolated cameras
-        # Generates 2 pseudo-cameras on the circumscribed circle defined by
-        # (nearest_1, current_cam, nearest_2), warps the current GT image into
-        # each pseudo-view using rendered plane_depth, and supervises the
-        # Gaussian render at that pseudo-view with a weighted L1 + SSIM loss.
+        #
+        # Pipeline:
+        #   1. Convert plane_depth → z_depth  (Bug #1 fix: they are NOT the same)
+        #   2. For each pseudo-cam (circle-interpolated between neighbours):
+        #      a. Warp GT image from viewpoint_cam → pseudo-cam using z_depth + conf mask
+        #      b. Hole-fill with warp from the cached neighbour camera  (Bug #2 fix)
+        #      c. Render Gaussians at pseudo-cam
+        #      d. Masked L1 loss  (Bug #3 fix: no masked SSIM — creates boundary artefacts)
+        #   3. Accumulate loss with weight = opt.lambda_depth_warp
         if (opt.lambda_depth_warp > 0
                 and iteration > opt.lambda_depth_warp_from_iter
                 and viewpoint_cam.uid in nearest_cams_dict
-                and len(nearest_cams_dict[viewpoint_cam.uid]) >= 2):
+                and len(nearest_cams_dict[viewpoint_cam.uid]) >= 2
+                and 'rendered_normal' in render_pkg):
 
-            _neighbors  = nearest_cams_dict[viewpoint_cam.uid]   # [cam_n1, cam_n2]
+            _neighbors   = nearest_cams_dict[viewpoint_cam.uid]
             _cam_n1, _cam_n2 = _neighbors[0], _neighbors[1]
 
-            # Confidence: only warp pixels where Gaussians cover the surface
-            _alpha_conf  = render_pkg["rendered_alpha"]           # [1, H, W]
-            _plane_depth = render_pkg["plane_depth"].squeeze().detach()  # [H, W]
-            _gt_rgb, _   = viewpoint_cam.get_image()              # [3, H, W]
+            # ── Convert plane_depth → z_depth (critical fix) ─────────────────────
+            # plane_depth = |n_cam · p_cam| (planar distance from renderer)
+            # z_depth     = Z coordinate in camera space (what backprojection needs)
+            _z_depth = plane_depth_to_z_depth(
+                render_pkg['plane_depth'].squeeze().detach(),
+                render_pkg['rendered_normal'].detach(),
+                viewpoint_cam.Fx, viewpoint_cam.Fy,
+                viewpoint_cam.Cx, viewpoint_cam.Cy,
+            )   # [H, W]
 
-            # Two pseudo-cameras on the circle:
-            #   A: midpoint between nearest_1 and current  (ref = nearest_2)
-            #   B: midpoint between current and nearest_2  (ref = nearest_1)
+            # Confidence mask: warp only where Gaussians cover the surface
+            _alpha_conf = render_pkg['rendered_alpha']   # [1, H, W]
+            _gt_rgb, _  = viewpoint_cam.get_image()      # [3, H, W]
+
+            # Two pseudo-cams on the circumscribed circle:
+            #   Pair A: midpoint between nearest_1 and current  (ref = nearest_2)
+            #   Pair B: midpoint between current and nearest_2  (ref = nearest_1)
+            # For each pair, the 'other' camera (not viewpoint_cam) provides the
+            # neighbour-side warp for hole-filling.
             _warp_pairs = [
                 (_cam_n1, viewpoint_cam, _cam_n2, 0.5),
                 (viewpoint_cam, _cam_n2, _cam_n1, 0.5),
             ]
 
-            _warp_loss_acc = torch.tensor(0.0, device="cuda")
+            _warp_loss_acc = torch.tensor(0.0, device='cuda')
             _n_valid_warps = 0
 
             for _ca, _cb, _cref, _t in _warp_pairs:
                 try:
                     _pseudo_cam = interpolate_camera_on_circle(_ca, _cb, _cref, _t)
 
+                    # ── Primary warp: current viewpoint → pseudo-cam ──────────
                     _warped_gt, _valid_mask = warp_image_rgb(
                         viewpoint_cam, _pseudo_cam,
-                        _plane_depth, _gt_rgb,
+                        _z_depth, _gt_rgb,
                         conf_map=_alpha_conf,
                         conf_threshold=opt.depth_warp_conf_threshold,
                     )
 
-                    if _valid_mask.sum() < 100:   # skip if too few valid pixels
+                    # ── Hole-filling: also warp from the neighbour camera ─────
+                    # The 'other' camera in each pair is the one ≠ viewpoint_cam.
+                    # We use its cached z_depth + GT image (from the previous
+                    # iteration it appeared as main viewpoint).
+                    _other = _ca if _ca.uid != viewpoint_cam.uid else _cb
+                    if _other.uid in depth_warp_cache:
+                        _nc = depth_warp_cache[_other.uid]
+                        _warped_n, _mask_n = warp_image_rgb(
+                            _other, _pseudo_cam,
+                            _nc['z_depth'], _nc['gt_image'],
+                            conf_map=None,          # use all cached pixels
+                            conf_threshold=opt.depth_warp_conf_threshold,
+                        )
+                        # Fill holes in primary warp with neighbour warp
+                        _fill = _mask_n & ~_valid_mask
+                        if _fill.any():
+                            _warped_gt = _warped_gt.clone()
+                            _warped_gt[:, _fill] = _warped_n[:, _fill]
+                            _valid_mask = _valid_mask | _fill
+
+                    if _valid_mask.sum() < 100:
                         continue
 
-                    # Render Gaussians at pseudo-view (no grad through warping)
+                    # Render Gaussians at pseudo-view
                     _pseudo_pkg = render(_pseudo_cam, gaussians, pipe, bg,
                                          return_plane=False, return_depth_normal=False)
-                    _pseudo_rendered = _pseudo_pkg["render"]  # [3, H, W]
+                    _pseudo_rendered = _pseudo_pkg['render']  # [3, H, W]
 
-                    # Masked L1 + SSIM loss (Pi-GS §3.6)
+                    # ── Masked L1 loss (no masked SSIM — creates boundary artefacts) ─
                     _mask3 = _valid_mask.unsqueeze(0).expand(3, -1, -1).float()
                     _n_px  = _valid_mask.float().sum().clamp(min=1.0)
-
-                    _l1_w   = ((_pseudo_rendered - _warped_gt).abs() * _mask3).sum() \
-                              / (_n_px * 3.0)
-                    _ssim_w = 1.0 - ssim(
-                        _pseudo_rendered * _mask3,
-                        _warped_gt       * _mask3,
-                    )
                     _warp_loss_acc = _warp_loss_acc + (
-                        (1.0 - opt.lambda_dssim) * _l1_w
-                        + opt.lambda_dssim * _ssim_w
-                    )
+                        (_pseudo_rendered - _warped_gt).abs() * _mask3
+                    ).sum() / (_n_px * 3.0)
                     _n_valid_warps += 1
 
-                except Exception:
-                    continue  # skip degenerate pseudo-cameras gracefully
+                except Exception as _e:
+                    print(f'[depth_warp iter={iteration}] {type(_e).__name__}: {_e}')
+                    continue
 
             if _n_valid_warps > 0:
                 loss += opt.lambda_depth_warp * (_warp_loss_acc / _n_valid_warps)

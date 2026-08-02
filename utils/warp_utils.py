@@ -23,6 +23,58 @@ import torch.nn.functional as F
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 0. plane_depth → z_depth conversion  (CRITICAL: must call before backproject)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plane_depth_to_z_depth(plane_depth, rendered_normal, fx, fy, cx_px, cy_px):
+    """
+    Convert PGSR 'plane_depth' to true z-depth (Z coordinate in camera space).
+
+    PGSR computes per-Gaussian plane distance as:
+        local_distance = |n_cam · p_cam|
+    where n_cam is the camera-space unit normal and p_cam is the camera-space
+    Gaussian center.  After alpha-blending this gives 'plane_depth'.
+
+    For a ray through pixel (u, v) with direction r = [(u-cx)/fx, (v-cy)/fy, 1]:
+        plane_depth[v,u] = z_depth[v,u] * |n · r|
+        => z_depth[v,u]  = plane_depth[v,u] / |n · r|
+
+    Args:
+        plane_depth:     [H, W] float tensor — PGSR rendered_distance / plane_depth
+        rendered_normal: [3, H, W] float tensor — camera-space normals from renderer
+        fx, fy:          float — focal lengths in pixels  (use cam.Fx, cam.Fy)
+        cx_px, cy_px:    float — principal point in pixels (use cam.Cx, cam.Cy)
+
+    Returns:
+        z_depth: [H, W] tensor — per-pixel Z depth in camera space
+    """
+    H, W = plane_depth.shape
+    device = plane_depth.device
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=torch.float32),
+        torch.arange(W, device=device, dtype=torch.float32),
+        indexing='ij',
+    )
+
+    # Unnormalized ray direction for each pixel: r = [(u-cx)/fx, (v-cy)/fy, 1]
+    dx = (xx - cx_px) / fx   # [H, W]
+    dy = (yy - cy_px) / fy   # [H, W]
+    # r_z = 1 (constant)
+
+    # dot(n, r) = nx*dx + ny*dy + nz*1
+    # Clamp away from 0 to avoid division instability on silhouette pixels
+    dot_n_r = (
+        rendered_normal[0] * dx
+        + rendered_normal[1] * dy
+        + rendered_normal[2]
+    ).abs().clamp(min=1e-3)   # [H, W]
+
+    z_depth = plane_depth / dot_n_r
+    return z_depth
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 1. Nearest-camera lookup
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -276,11 +328,13 @@ def warp_image_rgb(src_cam, pseudo_cam, depth_map, rgb_image,
     H, W   = depth_map.shape
     device = depth_map.device
 
-    # ── Source intrinsics (assume same for pseudo-cam — Pi-GS §3.6) ─────────
-    fx    = float(src_cam.image_width  / (2.0 * math.tan(src_cam.FoVx / 2.0)))
-    fy    = float(src_cam.image_height / (2.0 * math.tan(src_cam.FoVy / 2.0)))
-    cx_px = W / 2.0
-    cy_px = H / 2.0
+    # ── Source intrinsics (use Camera class attributes directly) ─────────────
+    # depth_map is expected to be TRUE Z-DEPTH (Z coordinate in camera space).
+    # If you have plane_depth from PGSR, call plane_depth_to_z_depth() first.
+    fx    = src_cam.Fx    # = image_width  / (2 * tan(FoVx/2))
+    fy    = src_cam.Fy    # = image_height / (2 * tan(FoVy/2))
+    cx_px = src_cam.Cx   # = image_width  / 2
+    cy_px = src_cam.Cy   # = image_height / 2
 
     # ── Confidence mask ──────────────────────────────────────────────────────
     if conf_map is not None:
