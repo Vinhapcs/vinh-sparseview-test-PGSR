@@ -17,6 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from scene.cre_filter import filter_redundant_points
 import numpy as np
 import torch
 
@@ -124,8 +125,25 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
+            # No CRE needed when loading a pre-trained checkpoint.
+            self.unfiltered_pcd = None
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            # ── Co-visible Redundancy Elimination ──────────────────────────
+            # Store the original dense cloud so that depth-warping (pseudo-view
+            # synthesis) can sample from unpruned geometry and avoid holes.
+            self.unfiltered_pcd = scene_info.point_cloud
+
+            # Run CRE only when training cameras are fully initialised and a
+            # depths/ directory exists at the source path.
+            _train_cams_for_cre = self.train_cameras.get(1.0, [])
+            filtered_pcd = filter_redundant_points(
+                pcd=scene_info.point_cloud,
+                train_cameras=_train_cams_for_cre,
+                dataset_path=self.source_path,
+                depth_tolerance=0.05,
+            )
+
+            self.gaussians.create_from_pcd(filtered_pcd, self.cameras_extent)
 
     def save(self, iteration, mask=None):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
