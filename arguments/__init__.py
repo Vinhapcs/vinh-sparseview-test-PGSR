@@ -131,7 +131,16 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth_from_iter = 1000  # [ABLATION: depth_prior] delay start until Gaussians stabilize
         self.lambda_normal = 0.5    # [ABLATION: normal_prior] ACTIVE — original: 0.5
         self.lambda_normal_from_iter = 1000  # [ABLATION: normal_prior] delay start
-        
+
+        # ── [Pi-GS §3.6: depth_warp] depth-warped pseudo-view supervision ────
+        # Generates pseudo-cameras via circle interpolation from 2 nearest
+        # neighbours, warps the GT image using rendered plane_depth, and
+        # supervises the Gaussian render at that pseudo-view with L1 + SSIM.
+        # Weight = 0.1 as specified in Pi-GS §3.6.
+        self.lambda_depth_warp = 0.1             # loss weight (Pi-GS: 0.1)
+        self.lambda_depth_warp_from_iter = 1000  # delay start (let Gaussians stabilise)
+        self.depth_warp_conf_threshold = 0.5     # rendered_alpha threshold for conf mask
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
