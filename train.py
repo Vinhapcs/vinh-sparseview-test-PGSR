@@ -253,7 +253,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # return_plane=True  : needed for flattening loss (core PGSR §3.2)
         # return_depth_normal: only needed for single-view normal consistency loss
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
-                            return_plane=True, return_depth_normal=False)
+                            return_plane=True, return_depth_normal=False,
+                            iteration=iteration, is_train=True)
         #
         # [ABLATION: app_model / single_view / depth_prior] full render call:
         # render_pkg = render(viewpoint_cam, gaussians, pipe, bg, app_model=app_model,
@@ -612,6 +613,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ── Backward ──────────────────────────────────────────────────────────
         loss.backward()
 
+        # STEREOGS_ADAPTIVE_OPACITY_DECAY_TRAIN_PATCH
+        # Must run AFTER loss.backward() so _opacity.grad is populated,
+        # and BEFORE optimizer.step() so the decayed values are used.
+        if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") == "1":
+            gaussians.adaptive_opacity_decay(
+                min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
+                sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
+            )
+
         # [ABLATION: two_phase_backward] FIX 3: 2-phase backward for clean densification gradients.
         # Separates image-loss gradient (used for densification) from auxiliary-loss gradients.
         # Prevents NCC/depth errors from causing spurious densification in sky/empty regions.
@@ -699,10 +709,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #     if prune_mask.sum() > 0:
             #         gaussians.prune_points(prune_mask)
 
-            # reset_opacity
+            # STEREOGS_DISABLE_OPACITY_RESET_PATCH
+            # StereoGS adaptive decay replaces periodic reset: if decay is active,
+            # skip reset_opacity so the two mechanisms don't conflict.
             if iteration < opt.densify_until_iter:
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                    if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") != "1":
+                        gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:

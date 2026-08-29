@@ -11,6 +11,7 @@
 
 import torch
 import math
+import os
 from diff_plane_rasterization import GaussianRasterizationSettings as PlaneGaussianRasterizationSettings
 from diff_plane_rasterization import GaussianRasterizer as PlaneGaussianRasterizer
 from scene.gaussian_model import GaussianModel
@@ -33,7 +34,8 @@ def render_normal(viewpoint_cam, depth, offset=None, normal=None, scale=1):
     return normal_ref
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
-           app_model: AppModel=None, return_plane = True, return_depth_normal = True):
+           app_model: AppModel=None, return_plane = True, return_depth_normal = True,
+           iteration: int = 0, is_train: bool = False):
     """
     Render the scene. 
     
@@ -56,6 +58,25 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means2D = screenspace_points
     means2D_abs = screenspace_points_abs
     opacity = pc.get_opacity
+
+    # DROPGAUSSIAN_ABLATION_PATCH
+    # Opacity dropout with linearly increasing rate: prevents Gaussians from
+    # over-committing to a single view early in training (DropGaussian, CVPR 2024).
+    # Controlled via env vars: DROPGAUSSIAN_ENABLED (default 1), DROPGAUSSIAN_MAX_RATE (default 0.2),
+    # DROPGAUSSIAN_SCHEDULE_STEPS (default 10000).
+    _drop_enabled = os.environ.get("DROPGAUSSIAN_ENABLED", "1") == "1"
+    if is_train and _drop_enabled:
+        _max_rate = float(os.environ.get("DROPGAUSSIAN_MAX_RATE", "0.2"))
+        _schedule_steps = int(os.environ.get("DROPGAUSSIAN_SCHEDULE_STEPS", "10000"))
+        _progress = min(float(iteration) / max(float(_schedule_steps), 1.0), 1.0)
+        _drop_rate = _max_rate * _progress
+        if _drop_rate > 0.0:
+            # torch.nn.Dropout scales surviving values by 1/(1-p) automatically,
+            # which acts as the compensation factor to preserve expected opacity.
+            _compensation = torch.nn.Dropout(p=_drop_rate)(
+                torch.ones(opacity.shape[0], dtype=torch.float32, device="cuda")
+            )
+            opacity = opacity * _compensation[:, None]
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.

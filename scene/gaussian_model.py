@@ -592,4 +592,42 @@ class GaussianModel:
         T = torch.tensor(fov_camera.T).float().cuda()
         pts = (pts-T)@R.transpose(-1,-2)
         return pts
-    
+
+    # STEREOGS_ADAPTIVE_OPACITY_DECAY_METHOD_PATCH
+    def adaptive_opacity_decay(self, min_decay_rate=0.99, sensitivity=0.5):
+        """
+        StereoGS gradient-aware opacity decay.
+
+        Normalizes each Gaussian's opacity-gradient magnitude by the current
+        mean gradient, then applies a stronger decay to low-gradient (under-
+        supervised) Gaussians.  High-gradient Gaussians are left nearly intact.
+
+        decay_factor = 1 - (1 - min_decay_rate) * exp(-sensitivity * grad_norm / mean_grad)
+
+          grad_norm / mean_grad ≈ 0  →  decay ≈ min_decay_rate  (aggressive)
+          grad_norm / mean_grad >> 1 →  decay ≈ 1.0             (almost none)
+
+        Controlled via env vars (called from train.py):
+          STEREOGS_OPACITY_DECAY_ENABLED (default "0")
+          STEREOGS_OPACITY_DECAY_FACTOR  (min_decay_rate, default 0.99)
+          STEREOGS_GRAD_SENSITIVITY      (sensitivity,    default 0.5)
+        """
+        if self._opacity.grad is None:
+            return
+
+        with torch.no_grad():
+            # Normalize gradients by mean magnitude
+            grad_norm = torch.norm(self._opacity.grad, dim=-1, keepdim=True)   # [N, 1]
+            avg_grad  = grad_norm.mean()
+            normalized_grad = grad_norm / (avg_grad + 1e-8)
+
+            # Decay factor: low grad → min_decay_rate, high grad → 1.0
+            penalty_strength = 1.0 - min_decay_rate
+            decay_factor = 1.0 - penalty_strength * torch.exp(
+                -sensitivity * normalized_grad
+            )
+
+            # Apply decay and re-encode through inverse activation
+            new_opacity = self.get_opacity * decay_factor
+            new_opacity = torch.clamp(new_opacity, min=1e-6, max=1.0 - 1e-6)
+            self._opacity.data = self.inverse_opacity_activation(new_opacity)
