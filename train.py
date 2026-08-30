@@ -613,14 +613,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ── Backward ──────────────────────────────────────────────────────────
         loss.backward()
 
-        # STEREOGS_ADAPTIVE_OPACITY_DECAY_TRAIN_PATCH
+        # [ABLATION: stereogs_opacity_decay] gradient-aware opacity decay (StereoGS)
         # Must run AFTER loss.backward() so _opacity.grad is populated,
         # and BEFORE optimizer.step() so the decayed values are used.
-        if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") == "1":
-            gaussians.adaptive_opacity_decay(
-                min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
-                sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
-            )
+        # if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") == "1":
+        #     gaussians.adaptive_opacity_decay(
+        #         min_decay_rate=float(os.environ.get("STEREOGS_OPACITY_DECAY_FACTOR", "0.99")),
+        #         sensitivity=float(os.environ.get("STEREOGS_GRAD_SENSITIVITY", "0.5")),
+        #     )
 
         # [ABLATION: two_phase_backward] FIX 3: 2-phase backward for clean densification gradients.
         # Separates image-loss gradient (used for densification) from auxiliary-loss gradients.
@@ -709,13 +709,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             #     if prune_mask.sum() > 0:
             #         gaussians.prune_points(prune_mask)
 
-            # STEREOGS_DISABLE_OPACITY_RESET_PATCH
-            # StereoGS adaptive decay replaces periodic reset: if decay is active,
-            # skip reset_opacity so the two mechanisms don't conflict.
+            # reset_opacity
             if iteration < opt.densify_until_iter:
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    if os.environ.get("STEREOGS_OPACITY_DECAY_ENABLED", "0") != "1":
-                        gaussians.reset_opacity()
+                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
